@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Automatic + staged OS, Docker, and Hermes updates with Telegram failure-only notification."
 author: Liew Wei Sung (Green-Needle-Tech)
-version: 2.0.0
+version: 2.0.2
 ---
 
 # Controlled System Update
