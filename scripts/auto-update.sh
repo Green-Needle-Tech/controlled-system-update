@@ -13,12 +13,14 @@ set -euo pipefail
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${CSU_CONFIG:-${SCRIPT_DIR}/../config/auto-update.conf}"
+CONFIG_FILE="${CSU_CONFIG:-/etc/controlled-system-update/auto-update.conf}"
 
-# Load config if it exists
+# Load config if it exists (re-export so functions and subshells can see them)
 if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck source=/dev/null
+    set -a
     source "$CONFIG_FILE"
+    set +a
 fi
 
 # Telegram settings (can be overridden in config or env)
@@ -70,7 +72,7 @@ log() {
     local msg="$*"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[${ts}] [${level}] ${msg}" | tee -a "$LOG_FILE"
+    echo "[${ts}] [${level}] ${msg}"
 }
 
 log_info()  { log "INFO"  "$@"; }
@@ -246,6 +248,20 @@ update_docker_images() {
     local failed=0
 
     while IFS='|' read -r name image; do
+        # Skip images that are locally built (image IDs, local names without registry prefix)
+        # Image IDs are 12-char hex strings; local images don't contain '/' or '.'
+        if [[ "$image" =~ ^[a-f0-9]{12}$ ]]; then
+            log_info "Skipping locally-built image (ID): $image (container: $name)"
+            continue
+        fi
+        # Skip if image name has no '/' (not a registry reference)
+        # e.g. "llm-smart-router:1.0" or "david-digital-hub-app" are local images
+        # Strip tag suffix to check the repository part only
+        local repo_part="${image%%:*}"
+        if [[ "$repo_part" != *"/"* ]]; then
+            log_info "Skipping local image (no registry): $image (container: $name)"
+            continue
+        fi
         log_info "Pulling image: $image (container: $name)"
         if docker pull "$image" >> "$LOG_FILE" 2>&1; then
             # Check if the pulled image is different from the running one
