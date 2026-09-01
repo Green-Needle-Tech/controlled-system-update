@@ -2,7 +2,7 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) on a root-host git-clone deployment with Docker services.
 
-**v2.1.0** — Now with fully automatic unattended updates, auto-reboot when required, and Telegram failure-only notification.
+**v2.2.0** — Hardened with atomic flock locking, needrestart integration, log rotation, GitHub Actions CI, and safer dist-upgrade defaults.
 
 ## What It Updates
 
@@ -93,6 +93,12 @@ AUTO_REBOOT="true"
 # Delay (in minutes) before auto-reboot — cancel with `shutdown -c`
 REBOOT_DELAY="5"
 
+# dist-upgrade can remove packages (riskier) — default: false
+DIST_UPGRADE="false"
+
+# Delete log files older than N days (0 = disable)
+LOG_RETENTION_DAYS="30"
+
 # Hermes paths (adjust for non-standard installs)
 HERMES_DIR="/usr/local/lib/hermes-agent"
 UV_BIN="/root/.local/bin/uv"
@@ -140,30 +146,36 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 
 ## Safety Features
 
-- **Lock file** — prevents concurrent runs (1h timeout for stale locks)
+- **Atomic locking** — `flock` prevents concurrent runs (no race conditions, auto-releases on crash)
 - **Non-interactive apt** — `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold`
 - **Package holds** — `apt-mark hold` for critical packages
 - **Config preservation** — dpkg options preserve existing config files
 - **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
 - **Memory limit** — 1G cap on systemd service
 - **Auto-reboot** — reboots automatically when `/var/run/reboot-required` is present (default: enabled), with configurable delay and pre-reboot Telegram notification
+- **needrestart** — automatically restarts services after library upgrades (if installed)
+- **Log rotation** — auto-deletes log files older than 30 days (configurable)
 - **Health checks** — systemd failed units, Docker status, Hermes gateway, disk/memory/load
 - **Hermes-safe** — git stash/pop preserves local mods, gateway restart + dashboard rebuild
 - **Docker-safe** — pulls images, recreates via compose, prunes dangling images
 - **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
+- **CI** — ShellCheck linting via GitHub Actions on every push
 
 ## File Structure
 
 ```
 controlled-system-update/
-├── SKILL.md                          # Full SRE procedure + auto-mode docs
-├── README.md                         # This file
-├── LICENSE                           # MIT
-├── install.sh                        # One-command installer
+├── .github/workflows/lint.yml         # ShellCheck CI
+├── CHANGELOG.md                       # Version history
+├── SKILL.md                           # Full SRE procedure + auto-mode docs
+├── README.md                          # This file
+├── LICENSE                            # MIT
+├── install.sh                         # One-command installer
+├── e2e-test.sh                        # End-to-end test suite
 ├── scripts/
-│   └── auto-update.sh                # Main automatic update script
+│   └── auto-update.sh                 # Main automatic update script
 ├── config/
-│   └── auto-update.conf              # Configuration template
+│   └── auto-update.conf               # Configuration template
 └── systemd/
     ├── controlled-system-update.service  # systemd service unit
     └── controlled-system-update.timer    # systemd daily timer

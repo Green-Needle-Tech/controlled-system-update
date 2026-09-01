@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Automatic + staged OS, Docker, and Hermes updates with Telegram failure-only notification."
 author: Liew Wei Sung (Green-Needle-Tech)
-version: 2.1.0
+version: 2.2.0
 ---
 
 # Controlled System Update
@@ -65,6 +65,8 @@ Key settings:
 - `PKG_HOLDS` — space-separated packages to exclude from upgrades
 - `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: true)
 - `REBOOT_DELAY` — minutes to wait before auto-reboot (default: 5, cancel with `shutdown -c`)
+- `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages, riskier)
+- `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
 - `HERMES_DIR` / `UV_BIN` / `HERMES_CLI` — paths for non-standard installations
 
 ### Manual operations
@@ -102,14 +104,18 @@ sudo systemctl enable --now controlled-system-update.timer
 
 ### Safety features
 
-- Lock file prevents concurrent runs (1h timeout)
+- Atomic `flock` locking prevents concurrent runs (no race conditions, auto-releases on crash)
 - `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold` — no apt prompts
 - Package holds respected (apt-mark hold)
 - Low priority (Nice=10, CPUWeight=50) — won't starve production services
 - Memory limit (1G) on systemd service
+- `needrestart` integration: auto-restarts services after library upgrades (if installed)
+- Log rotation: auto-deletes log files older than `LOG_RETENTION_DAYS` (default: 30)
+- Pre-reboot graceful shutdown: stops Docker containers and Hermes gateway before `shutdown`
 - Post-update health checks: systemd failed units, Docker container status, Hermes gateway, disk/memory/load
 - Hermes git stash/pop preserves local modifications
 - Dashboard rebuilt + restarted after Hermes updates
+- GitHub Actions CI with ShellCheck linting on every push
 
 ## Mode 2 — Manual Controlled Update (SRE procedure)
 

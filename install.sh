@@ -32,8 +32,9 @@ if [[ -f "${CONFIG_DIR}/auto-update.conf" ]]; then
     echo "  -> Config already exists, backing up..."
     cp "${CONFIG_DIR}/auto-update.conf" "${CONFIG_DIR}/auto-update.conf.bak.$(date +%Y%m%d)"
 fi
-install -Dm644 "${SCRIPT_DIR}/config/auto-update.conf" "${CONFIG_DIR}/auto-update.conf"
-echo "  -> Installed ${CONFIG_DIR}/auto-update.conf"
+install -Dm600 "${SCRIPT_DIR}/config/auto-update.conf" "${CONFIG_DIR}/auto-update.conf"
+chmod 600 "${CONFIG_DIR}/auto-update.conf"
+echo "  -> Installed ${CONFIG_DIR}/auto-update.conf (permissions: 600)"
 echo "  -> EDIT THIS FILE to set your Telegram bot token and chat ID!"
 
 # 3. Install systemd units

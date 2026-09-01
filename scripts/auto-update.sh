@@ -8,11 +8,10 @@
 # License: MIT
 # Author: Liew Wei Sung (Green-Needle-Tech)
 #
-set -euo pipefail
+set -uo pipefail
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CSU_CONFIG:-/etc/controlled-system-update/auto-update.conf}"
 
 # Load config if it exists (re-export so functions and subshells can see them)
@@ -40,10 +39,6 @@ LOG_DIR="${LOG_DIR:-/var/log/controlled-system-update}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/auto-update-$(date +%Y%m%d-%H%M%S).log}"
 LAST_LOG="${LOG_DIR}/last-run.log"
 
-# Lock file to prevent concurrent runs
-LOCK_FILE="${LOCK_FILE:-/var/lock/controlled-system-update.lock}"
-LOCK_TIMEOUT="${LOCK_TIMEOUT:-3600}"  # 1 hour max
-
 # Package holds (space-separated list to exclude from upgrades)
 PKG_HOLDS="${PKG_HOLDS:-}"
 
@@ -52,6 +47,13 @@ AUTO_REBOOT="${AUTO_REBOOT:-true}"
 
 # Delay (in minutes) before auto-reboot — gives time for notification and graceful shutdown
 REBOOT_DELAY="${REBOOT_DELAY:-5}"
+
+# Whether to run dist-upgrade (can remove packages — riskier than upgrade)
+# Default: false for safety in automatic mode; set true for manual/maintenance runs
+DIST_UPGRADE="${DIST_UPGRADE:-false}"
+
+# Log retention: delete log files older than N days (0 = disable cleanup)
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 
 # Whether to update Docker images
 UPDATE_DOCKER="${UPDATE_DOCKER:-true}"
@@ -121,26 +123,21 @@ add_warning() {
     WARNINGS+="\n<b>[${section}]</b> ${detail}\n"
 }
 
-# ─── Lock management ─────────────────────────────────────────────────────────
+# ─── Lock management (atomic via flock) ───────────────────────────────────────
+
+LOCK_FILE="${LOCK_FILE:-/var/lock/controlled-system-update.lock}"
+LOCK_FD=200
 
 acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local lock_age
-        lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
-        if (( lock_age < LOCK_TIMEOUT )); then
-            log_error "Another update is already running (lock age: ${lock_age}s)"
-            exit 1
-        else
-            log_warn "Stale lock found (age: ${lock_age}s), removing"
-            rm -f "$LOCK_FILE"
-        fi
+    eval "exec ${LOCK_FD}>\"$LOCK_FILE\""
+    if ! flock -n ${LOCK_FD}; then
+        local lock_pid
+        lock_pid="$(cat "$LOCK_FILE" 2>/dev/null || echo 'unknown')"
+        log_error "Another update is already running (PID: ${lock_pid})"
+        exit 1
     fi
-    echo $$ > "$LOCK_FILE"
-    trap 'release_lock' EXIT
-}
-
-release_lock() {
-    rm -f "$LOCK_FILE" 2>/dev/null || true
+    echo $$ >&${LOCK_FD}
+    # flock is automatically released when the process exits — no trap needed
 }
 
 # ─── Update functions ────────────────────────────────────────────────────────
@@ -174,15 +171,19 @@ update_os_packages() {
         return 1
     fi
 
-    log_info "Running apt-get dist-upgrade..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
-        -o Dpkg::Options::="--force-confmiss" \
-        >> "$LOG_FILE" 2>&1; then
-        add_error "OS" "apt-get dist-upgrade failed"
-        log_error "apt-get dist-upgrade failed"
-        return 1
+    if [[ "$DIST_UPGRADE" == "true" ]]; then
+        log_info "Running apt-get dist-upgrade (DIST_UPGRADE=true)..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            -o Dpkg::Options::="--force-confmiss" \
+            >> "$LOG_FILE" 2>&1; then
+            add_error "OS" "apt-get dist-upgrade failed"
+            log_error "apt-get dist-upgrade failed"
+            return 1
+        fi
+    else
+        log_info "Skipping dist-upgrade (DIST_UPGRADE=false) — use manual mode for dist-upgrade"
     fi
 
     log_info "Running apt-get autoremove..."
@@ -193,6 +194,28 @@ update_os_packages() {
 
     log_info "Running apt-get autoclean..."
     DEBIAN_FRONTEND=noninteractive apt-get autoclean -y >> "$LOG_FILE" 2>&1 || true
+
+    # Run needrestart to check for services needing restart after library upgrades
+    if command -v needrestart &>/dev/null; then
+        log_info "Running needrestart to identify services needing restart..."
+        local nr_output
+        nr_output="$(needrestart -b 2>/dev/null || true)"
+        if [[ -n "$nr_output" ]]; then
+            # Check if any services need restarting
+            local nr_services
+            nr_services="$(echo "$nr_output" | grep -E '^NEEDRESTART-SVC' | awk '{print $3}' || true)"
+            if [[ -n "$nr_services" ]]; then
+                log_info "needrestart identified services to restart: $(echo "$nr_services" | tr '\n' ' ')"
+                # Restart services via needrestart in batch mode (non-interactive)
+                needrestart -r a 2>/dev/null >> "$LOG_FILE" 2>&1 || true
+                log_info "Service restarts completed via needrestart"
+            else
+                log_info "needrestart: no services need restarting"
+            fi
+        fi
+    else
+        log_info "needrestart not installed, skipping service restart check"
+    fi
 
     # Check if reboot is required
     if [[ -f /var/run/reboot-required ]]; then
@@ -207,6 +230,18 @@ update_os_packages() {
             reboot_msg+="\n<b>[OS]</b> Reboot required after system update — auto-rebooting in ${REBOOT_DELAY} minutes."
             reboot_msg+="\nServices will restart automatically after reboot."
             notify_telegram "$reboot_msg"
+            # Gracefully stop services before reboot
+            log_info "Gracefully stopping Docker containers before reboot..."
+            if command -v docker &>/dev/null; then
+                docker stop "$(docker ps -q 2>/dev/null)" 2>/dev/null >> "$LOG_FILE" 2>&1 || true
+            fi
+            log_info "Gracefully stopping Hermes gateway before reboot..."
+            local gw_pid
+            gw_pid="$(pgrep -f 'hermes.*gateway run' 2>/dev/null || true)"
+            if [[ -n "$gw_pid" ]]; then
+                kill -TERM "$gw_pid" 2>/dev/null || true
+                sleep 2
+            fi
             shutdown -r "+${REBOOT_DELAY}" "Automatic reboot after system update" 2>/dev/null || true
         else
             add_warning "OS" "Reboot required but AUTO_REBOOT=false - manual reboot needed"
@@ -283,18 +318,27 @@ update_docker_images() {
                 # Try to recreate using docker compose if a compose file exists
                 local compose_dir=""
                 compose_dir="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2>/dev/null || echo "")"
-                if [[ -n "$compose_dir" && -f "${compose_dir}/docker-compose.yml" ]]; then
-                    log_info "Using docker compose at $compose_dir"
-                    if ! (cd "$compose_dir" && docker compose up -d --force-recreate "$name" >> "$LOG_FILE" 2>&1); then
-                        add_error "Docker" "Failed to recreate container $name via compose"
-                        failed=$((failed + 1))
+                if [[ -n "$compose_dir" ]]; then
+                    local compose_file=""
+                    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+                        if [[ -f "${compose_dir}/${f}" ]]; then
+                            compose_file="${compose_dir}/${f}"
+                            break
+                        fi
+                    done
+                    if [[ -n "$compose_file" ]]; then
+                        log_info "Using docker compose at $compose_file"
+                        if ! (cd "$compose_dir" && docker compose -f "$compose_file" up -d --force-recreate "$name" >> "$LOG_FILE" 2>&1); then
+                            add_error "Docker" "Failed to recreate container $name via compose"
+                            failed=$((failed + 1))
+                        else
+                            updated=$((updated + 1))
+                        fi
                     else
-                        updated=$((updated + 1))
+                        # No compose file found — just note that a restart is needed
+                        add_warning "Docker" "Image updated for $name but no compose file found - manual recreate needed"
+                        log_warn "No compose file for $name, manual recreate needed"
                     fi
-                else
-                    # No compose file — just note that a restart is needed
-                    add_warning "Docker" "Image updated for $name but no compose file found - manual recreate needed"
-                    log_warn "No compose file for $name, manual recreate needed"
                 fi
             fi
         else
@@ -322,7 +366,7 @@ update_hermes_agent() {
         return 0
     fi
 
-    cd "$HERMES_DIR"
+    cd "$HERMES_DIR" || return 1
 
     # Record current commit
     local old_commit
@@ -446,7 +490,8 @@ import sys, json
 try:
     for t in json.load(sys.stdin):
         print(t.get('name', ''))
-except: pass
+except Exception:
+    pass
 " 2>/dev/null || true)"
         if [[ -n "$tools" ]]; then
             for tool in $tools; do
@@ -539,9 +584,11 @@ run_health_checks() {
     # Check load average
     local load1
     load1="$(awk '{print $1}' /proc/loadavg)"
+    local load1_x100
+    load1_x100="$(awk '{printf "%d", $1 * 100}' /proc/loadavg)"
     local cpu_count
     cpu_count="$(nproc)"
-    if (( $(echo "$load1 > $cpu_count * 2" | bc -l 2>/dev/null || echo 0) )); then
+    if (( load1_x100 > cpu_count * 200 )); then
         add_warning "Health" "High load average: ${load1} (CPUs: ${cpu_count})"
     fi
 
@@ -558,6 +605,12 @@ main() {
     : > "$LOG_FILE"
     : > "$LAST_LOG"
 
+    # Log rotation: delete old log files
+    if [[ "${LOG_RETENTION_DAYS:-0}" -gt 0 ]]; then
+        find "$LOG_DIR" -name "auto-update-*.log" -mtime "+${LOG_RETENTION_DAYS}" -delete 2>/dev/null || true
+        log_info "Cleaned up log files older than ${LOG_RETENTION_DAYS} days"
+    fi
+
     # Redirect all output to both LOG_FILE and LAST_LOG via tee
     exec > >(tee -a "$LOG_FILE" "$LAST_LOG") 2>&1
 
@@ -568,16 +621,16 @@ main() {
 
     acquire_lock
 
-    # Run all update phases
-    update_os_packages     || true
-    update_snap_packages   || true
-    update_docker_images   || true
-    update_hermes_agent    || true
-    update_python_packages || true
-    update_npm_packages    || true
+    # Run all update phases (each function handles its own errors via add_error/add_warning)
+    update_os_packages
+    update_snap_packages
+    update_docker_images
+    update_hermes_agent
+    update_python_packages
+    update_npm_packages
 
     # Health checks
-    run_health_checks || true
+    run_health_checks
 
     # Final assessment
     log_info "========================================"
