@@ -261,9 +261,9 @@ update_docker_images() {
                     log_info "Using docker compose at $compose_dir"
                     if ! (cd "$compose_dir" && docker compose up -d --force-recreate "$name" >> "$LOG_FILE" 2>&1); then
                         add_error "Docker" "Failed to recreate container $name via compose"
-                        ((failed++))
+                        failed=$((failed + 1))
                     else
-                        ((updated++))
+                        updated=$((updated + 1))
                     fi
                 else
                     # No compose file — just note that a restart is needed
@@ -274,7 +274,7 @@ update_docker_images() {
         else
             add_error "Docker" "Failed to pull image $image for container $name"
             log_error "Failed to pull $image"
-            ((failed++))
+            failed=$((failed + 1))
         fi
     done <<< "$containers"
 
@@ -488,7 +488,7 @@ run_health_checks() {
         if ! pgrep -f 'hermes.*gateway run' >/dev/null 2>&1; then
             add_error "Health" "Hermes gateway is not running"
             log_error "Hermes gateway DOWN"
-            ((failures++))
+            failures=$((failures + 1))
         fi
     fi
 
@@ -498,7 +498,7 @@ run_health_checks() {
     if (( disk_usage > 90 )); then
         add_error "Health" "Disk usage at ${disk_usage}% on /"
         log_error "Critical disk usage: ${disk_usage}%"
-        ((failures++))
+        failures=$((failures + 1))
     elif (( disk_usage > 80 )); then
         add_warning "Health" "Disk usage at ${disk_usage}% on /"
     fi
@@ -528,11 +528,12 @@ run_health_checks() {
 main() {
     # Setup
     mkdir -p "$LOG_DIR"
-    # Truncate last-run.log and link current log
+    # Start fresh log file
+    : > "$LOG_FILE"
     : > "$LAST_LOG"
-    exec > >(tee -a "$LAST_LOG") 2>&1
-    echo "" > "$LOG_FILE"  # start fresh
-    exec >> "$LOG_FILE" 2>&1
+
+    # Redirect all output to both LOG_FILE and LAST_LOG via tee
+    exec > >(tee -a "$LOG_FILE" "$LAST_LOG") 2>&1
 
     log_info "========================================"
     log_info "Controlled System Update - $(date)"
