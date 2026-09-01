@@ -1,0 +1,27 @@
+[Unit]
+Description=Controlled System Update - Automatic all-software update
+Documentation=https://github.com/Green-Needle-Tech/controlled-system-update
+Wants=network-online.target
+After=network-online.target docker.service
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/auto-update.sh
+# Config file location (set CSU_CONFIG if not using default path)
+# Environment=CSU_CONFIG=/etc/controlled-system-update/auto-update.conf
+# Resource limits
+MemoryMax=1G
+CPUWeight=50
+# Timeout (1 hour)
+TimeoutStartSec=3600
+# Nice level (lower priority — don't starve production services)
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

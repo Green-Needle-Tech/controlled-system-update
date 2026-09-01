@@ -1,19 +1,20 @@
 ---
 name: controlled-system-update
-description: "Staged OS + Hermes updates with compatibility pre-check."
-author: Iris (CTO Assistant)
-version: 1.0.0
+description: "Automatic + staged OS, Docker, and Hermes updates with Telegram failure-only notification."
+author: Liew Wei Sung (Green-Needle-Tech)
+version: 2.0.0
 ---
 
 # Controlled System Update
 
-Expert Linux sysadmin/SRE procedure for a controlled server update: OS packages, server software, and the Hermes Agent — compatibility-evaluated before execution, fully verified after. The automated daily/monthly update crons were removed on 2026-09-01 at David's request; this skill is now the manual, on-demand update path.
+Expert Linux sysadmin/SRE procedure for comprehensive server updates: OS packages, Snap, Docker images, Hermes Agent, Python/uv tools, and npm globals. Two modes: **automatic** (daily, unattended, Telegram on failure only) and **manual** (staged, compatibility-checked, interactive).
 
 ## When to Use
 
-- David asks to update the server, run a controlled update, or update OS/Hermes
-- A Hermes release notes breaking changes and an update is planned
-- Don't use for: Docker image updates (`automatic-docker-service-updates`), skills/plugins updates, routine diagnostics (`host-maintenance`)
+- David asks to update the server, run a controlled update, or update OS/Hermes/Docker
+- Automatic mode is already installed and David wants to check/modify it
+- A Hermes release notes breaking changes and a manual update is planned
+- Don't use for: skills/plugins updates, routine diagnostics (`host-maintenance`)
 
 ## Deployment Profile (this host)
 
@@ -23,8 +24,97 @@ Expert Linux sysadmin/SRE procedure for a controlled server update: OS packages,
 - CLI: `/usr/local/bin/hermes` wrapper
 - Gateway: `hermes gateway run --replace`, NO auto-respawn — manual restart after any kill
 - Dashboard: systemd `hermes-dashboard` on port 9119, needs `npm run build` after Hermes updates
+- Docker: BunkerWeb WAF + internal services
+- Telegram: bot token + chat ID in `/etc/controlled-system-update/auto-update.conf`
 
-## Phase 1 — Pre-Check & Compatibility Evaluation (no upgrades yet)
+## Mode 1 — Automatic Updates (default)
+
+Runs daily at 04:00 via systemd timer. No user intervention. Telegram notification ONLY on failure or warnings.
+
+### What gets updated automatically
+
+1. **OS packages** — apt update + upgrade + dist-upgrade + autoremove + autoclean
+2. **Snap packages** — snap refresh (if snap is installed)
+3. **Docker images** — pulls latest images for all running containers, recreates via docker-compose if image changed, prunes dangling images
+4. **Hermes Agent** — git stash + pull + stash pop + uv sync + gateway restart + dashboard rebuild
+5. **Python/uv tools** — upgrades all uv-installed CLI tools
+6. **npm global packages** — npm update -g
+
+### Installation
+
+```bash
+git clone https://github.com/Green-Needle-Tech/controlled-system-update.git
+cd controlled-system-update
+sudo bash install.sh
+```
+
+Then edit the config:
+
+```bash
+sudo nano /etc/controlled-system-update/auto-update.conf
+# Set TG_BOT_TOKEN and TG_CHAT_ID
+```
+
+### Configuration
+
+Config file: `/etc/controlled-system-update/auto-update.conf`
+
+Key settings:
+- `TG_BOT_TOKEN` / `TG_CHAT_ID` — Telegram notification target (required for notifications)
+- `UPDATE_DOCKER` / `UPDATE_HERMES` / `UPDATE_SNAP` / `UPDATE_NPM` / `UPDATE_PYTHON` — toggle each phase (true/false)
+- `PKG_HOLDS` — space-separated packages to exclude from upgrades
+- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: false)
+- `HERMES_DIR` / `UV_BIN` / `HERMES_CLI` — paths for non-standard installations
+
+### Manual operations
+
+```bash
+# Run update immediately
+sudo /usr/local/bin/auto-update.sh
+
+# Check timer status
+systemctl status controlled-system-update.timer
+
+# Check next scheduled run
+systemctl list-timers controlled-system-update
+
+# View logs
+journalctl -u controlled-system-update -f
+# or
+tail -f /var/log/controlled-system-update/last-run.log
+
+# Trigger via systemd
+sudo systemctl start controlled-system-update.service
+
+# Disable automatic updates
+sudo systemctl disable --now controlled-system-update.timer
+
+# Re-enable
+sudo systemctl enable --now controlled-system-update.timer
+```
+
+### Notification behavior
+
+- **Success (no issues)**: Silent — no Telegram message sent
+- **Warnings (non-fatal)**: Telegram message with warning details
+- **Errors (failures)**: Telegram message with error details + log path
+
+### Safety features
+
+- Lock file prevents concurrent runs (1h timeout)
+- `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold` — no apt prompts
+- Package holds respected (apt-mark hold)
+- Low priority (Nice=10, CPUWeight=50) — won't starve production services
+- Memory limit (1G) on systemd service
+- Post-update health checks: systemd failed units, Docker container status, Hermes gateway, disk/memory/load
+- Hermes git stash/pop preserves local modifications
+- Dashboard rebuilt + restarted after Hermes updates
+
+## Mode 2 — Manual Controlled Update (SRE procedure)
+
+For when David wants a human-in-the-loop update with compatibility pre-checks. Use when a major Hermes release is pending or when evaluating breaking changes.
+
+### Phase 1 — Pre-Check & Compatibility Evaluation (no upgrades yet)
 
 Completion criterion: a GO/NO-GO risk statement covering every finding.
 
@@ -48,7 +138,7 @@ grep -E 'requires-python|python' /usr/local/lib/hermes-agent/pyproject.toml | he
 
 Then summarize the dependency graph and state explicitly whether `apt upgrade` risks Hermes. Watch items: Python minor/major bumps, libc6/openssl, systemd, docker.io, nodejs. Present findings + planned commands to David before executing — production-host package updates require his approval.
 
-## Phase 2 — Dry Run & Simulation
+### Phase 2 — Dry Run & Simulation
 
 Completion criterion: incoming package list inspected, breaking changes flagged.
 
@@ -58,7 +148,7 @@ apt-get upgrade --simulate 2>/dev/null | grep '^Inst ' | awk '{print $2, $3}' | 
 apt-get upgrade --simulate 2>/dev/null | grep -c '^Inst '   # total count
 ```
 
-## Phase 3 — Staged Execution
+### Phase 3 — Staged Execution
 
 ### 3.1 OS update
 
@@ -70,6 +160,8 @@ DEBIAN_FRONTEND=noninteractive apt-get update
 
 ```bash
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+  -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
+DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
   -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
 ```
@@ -102,7 +194,7 @@ Completion criterion: `git log -1` shows the new upstream commit; `git status --
 ~/.local/bin/uv pip install -e .
 ```
 
-### 3.5 Restart gateway + rebuild dashboard (after ANY Hermes update)
+### 3.3.5 Restart gateway + rebuild dashboard (after ANY Hermes update)
 
 ```bash
 kill -TERM $(pgrep -f "hermes.*gateway run") 2>/dev/null; sleep 3
@@ -113,7 +205,7 @@ cd /usr/local/lib/hermes-agent/web && npm run build
 systemctl restart hermes-dashboard
 ```
 
-## Phase 4 — Post-Update Verification
+### Phase 4 — Post-Update Verification
 
 Completion criterion: every check passes or has a logged repair action.
 
@@ -142,14 +234,22 @@ Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) t
 | Dashboard "frontend not built" crash | `cd web && npm run build && systemctl restart hermes-dashboard` |
 | Broken apt package | pin: `apt-get install <pkg>=<oldver>`; hold: `apt-mark hold <pkg>` |
 | BunkerWeb FATAL after reboot | `docker exec bunkerweb supervisorctl start bunkerweb` |
+| Lock file stuck | `rm /var/lock/controlled-system-update.lock` |
+| Telegram not sending | Check TG_BOT_TOKEN/TG_CHAT_ID in config, test with curl |
 
 ## Output Format
 
+### Automatic mode
+1. Log file at `/var/log/controlled-system-update/auto-update-<timestamp>.log`
+2. `last-run.log` symlink to most recent run
+3. Telegram message only on failure/warning
+
+### Manual mode
 1. Pre-Check compatibility findings (versions, requirements, changelog risks, GO/NO-GO)
 2. Planned commands, step-by-step
 3. Each stage executed with results
-4. Post-verification table (check → result)
-5. Status summary: what changed, versions before → after, any repairs
+4. Post-verification table (check -> result)
+5. Status summary: what changed, versions before -> after, any repairs
 
 ## Pitfalls
 
@@ -159,6 +259,8 @@ Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) t
 - Gateway never auto-respawns on this host — every kill needs a manual start + pgrep verify
 - apt prompts hang scripts — always DEBIAN_FRONTEND=noninteractive + force-confdef/confold
 - Hermes update stops the dashboard — always rebuild + restart it after
+- Docker image pulls can fail due to rate limits — script logs but doesn't fail the whole run
+- snap refresh can hold locks — non-fatal warning only
 - Full pitfall catalog: `host-maintenance` skill
 
 ## Related Skills
@@ -166,3 +268,4 @@ Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) t
 - `host-maintenance` — deployment profile details, full pitfall catalog, disk cleanup, diagnostics
 - `hermes-gateway-operations` — gateway restart protocol
 - `hermes-cron-troubleshooting` — if re-automating updates via cron
+- `automatic-docker-service-updates` — alternative Docker-only update approach

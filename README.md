@@ -1,44 +1,184 @@
 # Controlled System Update
 
-A staged, compatibility-checked update procedure for Linux servers running the [Hermes Agent](https://github.com/NousResearch/hermes-agent) on a root-host git-clone deployment.
+A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) on a root-host git-clone deployment with Docker services.
 
-Turns "update the server" from an ad-hoc command sequence into a repeatable SRE workflow:
+**v2.0.0** — Now with fully automatic unattended updates and Telegram failure-only notification.
 
-1. **Pre-Check & Compatibility Evaluation** — inventory OS, runtimes, and the Hermes Agent version; check release notes for breaking changes; produce an explicit GO/NO-GO before anything is upgraded.
-2. **Dry Run & Simulation** — `apt-get upgrade --simulate` with inspection of incoming packages for breaking changes (Python bumps, libc/openssl, systemd).
-3. **Staged Execution** — OS update → noninteractive upgrades (configs preserved) → Hermes Agent update (session-safe git path or backgrounded `hermes update`) → venv rebuild → gateway restart + dashboard rebuild.
-4. **Post-Update Verification** — `hermes doctor`, gateway, Docker, BunkerWeb supervisor, dashboard/Hindsight/DDH health endpoints, and a live test invocation.
-5. **Repair Playbook** — non-destructive fixes for the known failure modes (package pin/hold, stash conflicts, venv resync, dashboard rebuild).
+## What It Updates
 
-## Why
+The automatic mode updates **all software** on the server:
 
-`hermes update` restarts the gateway, which kills any agent session that invoked it. Combined with a venv that has no `pip` binary (uv-managed), a gateway that never auto-respawns, and apt prompts that hang non-interactive scripts, a naive "apt upgrade && hermes update" breaks the agent in at least four distinct ways. This skill encodes the working order of operations and the repair paths for each.
+| Component | Method |
+|-----------|--------|
+| OS packages | apt update + upgrade + dist-upgrade + autoremove |
+| Snap packages | snap refresh |
+| Docker images | Pull latest for all running containers, recreate via compose if changed |
+| Hermes Agent | git stash + pull + stash pop + uv sync + gateway restart + dashboard rebuild |
+| Python/uv tools | uv tool upgrade (all installed tools) |
+| npm global packages | npm update -g |
+
+## Two Modes
+
+### Automatic Mode (default)
+
+- Runs daily at 04:00 via systemd timer (with 30min random delay)
+- **No user intervention** — fully unattended
+- **Telegram notification ONLY on failure or warnings** — silent on success
+- Lock file prevents concurrent runs
+- Low system priority (Nice=10) — won't starve production services
+- Post-update health checks (systemd, Docker, Hermes gateway, disk/memory/load)
+
+### Manual Mode (SRE procedure)
+
+- Human-in-the-loop with compatibility pre-checks
+- GO/NO-GO gate before any upgrades
+- Dry-run simulation to inspect incoming packages
+- Staged execution with verification after each phase
+- Use when evaluating breaking changes from major releases
 
 ## Install
 
-Hermes Agent skill — copy into your skills tree:
-
 ```bash
-mkdir -p ~/.hermes/skills/devops/controlled-system-update
-curl -fsSL https://raw.githubusercontent.com/Green-Needle-Tech/controlled-system-update/main/SKILL.md \
-  -o ~/.hermes/skills/devops/controlled-system-update/SKILL.md
+git clone https://github.com/Green-Needle-Tech/controlled-system-update.git
+cd controlled-system-update
+sudo bash install.sh
 ```
 
-The skill loads on demand in new sessions. Requires: Ubuntu/Debian host (apt), Hermes Agent installed as a git clone at `/usr/local/lib/hermes-agent` with a uv-managed venv. The procedure generalizes to other layouts — adjust the paths in the Deployment Profile section.
+Then configure:
 
-## Quick Start
+```bash
+sudo nano /etc/controlled-system-update/auto-update.conf
+# Set TG_BOT_TOKEN and TG_CHAT_ID for Telegram notifications
+```
+
+### Requirements
+
+- Ubuntu/Debian host with `apt`
+- `curl` (for Telegram API)
+- Docker (optional — skipped if not installed)
+- Hermes Agent installed as git clone (optional — skipped if not found)
+- `uv` package manager (optional — for Python tool updates)
+- `npm` (optional — for global package updates)
+- A Telegram bot token and chat ID (for failure notifications)
+
+### Getting Telegram credentials
+
+1. Create a bot via [@BotFather](https://t.me/botfather) — get the **BOT_TOKEN**
+2. Get your chat ID from [@userinfobot](https://t.me/userinfobot) — that's your **CHAT_ID**
+3. Put both in `/etc/controlled-system-update/auto-update.conf`
+
+## Configuration
+
+Config file: `/etc/controlled-system-update/auto-update.conf`
+
+```bash
+# Telegram
+TG_BOT_TOKEN="123456:ABC-DEF..."
+TG_CHAT_ID="123456789"
+
+# Toggle update phases
+UPDATE_DOCKER="true"
+UPDATE_HERMES="true"
+UPDATE_SNAP="true"
+UPDATE_NPM="true"
+UPDATE_PYTHON="true"
+
+# Packages to hold (never auto-upgrade)
+PKG_HOLDS=""
+
+# Auto-reboot if required
+AUTO_REBOOT="false"
+
+# Hermes paths (adjust for non-standard installs)
+HERMES_DIR="/usr/local/lib/hermes-agent"
+UV_BIN="/root/.local/bin/uv"
+```
+
+## Usage
+
+### Automatic mode
+
+```bash
+# Check timer status
+systemctl status controlled-system-update.timer
+
+# See next scheduled run
+systemctl list-timers controlled-system-update
+
+# Run manually right now
+sudo /usr/local/bin/auto-update.sh
+
+# Trigger via systemd
+sudo systemctl start controlled-system-update.service
+
+# View logs
+journalctl -u controlled-system-update -f
+tail -f /var/log/controlled-system-update/last-run.log
+
+# Disable/enable
+sudo systemctl disable --now controlled-system-update.timer
+sudo systemctl enable --now controlled-system-update.timer
+```
+
+### Manual mode (SRE procedure)
 
 Ask your Hermes agent: *"run a controlled system update"* — the agent executes Phase 1 (pre-check, no changes), presents findings + planned commands, then proceeds through the staged phases with verification after each.
 
-## Skill Preview
+The full SRE procedure is documented in [SKILL.md](SKILL.md).
 
-The full procedure lives in [SKILL.md](SKILL.md). Highlights:
+## Notification Behavior
 
-- **GO/NO-GO gate** — no upgrade runs until the compatibility summary is presented
-- **Session-safe Hermes update** — manual `git stash` → `git pull` → `git stash pop` path when running inside an agent session; backgrounded `hermes update --yes --no-backup` from a plain terminal
-- **Prompt-free apt** — `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold` so scripts never hang
-- **Dashboard rebuild** — Hermes updates stop the dashboard; the skill rebuilds and restarts it every time
-- **Verification table** — every check has a pass criterion and a logged repair action on failure
+| Outcome | Telegram |
+|---------|----------|
+| Success (no issues) | Silent — no message |
+| Warnings (non-fatal) | Message with warning details |
+| Errors (failures) | Message with error details + log path |
+
+## Safety Features
+
+- **Lock file** — prevents concurrent runs (1h timeout for stale locks)
+- **Non-interactive apt** — `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold`
+- **Package holds** — `apt-mark hold` for critical packages
+- **Config preservation** — dpkg options preserve existing config files
+- **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
+- **Memory limit** — 1G cap on systemd service
+- **Health checks** — systemd failed units, Docker status, Hermes gateway, disk/memory/load
+- **Hermes-safe** — git stash/pop preserves local mods, gateway restart + dashboard rebuild
+- **Docker-safe** — pulls images, recreates via compose, prunes dangling images
+- **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
+
+## File Structure
+
+```
+controlled-system-update/
+├── SKILL.md                          # Full SRE procedure + auto-mode docs
+├── README.md                         # This file
+├── LICENSE                           # MIT
+├── install.sh                        # One-command installer
+├── scripts/
+│   └── auto-update.sh                # Main automatic update script
+├── config/
+│   └── auto-update.conf              # Configuration template
+└── systemd/
+    ├── controlled-system-update.service  # systemd service unit
+    └── controlled-system-update.timer    # systemd daily timer
+```
+
+## Why
+
+`hermes update` restarts the gateway, which kills any agent session that invoked it. Combined with a venv that has no `pip` binary (uv-managed), a gateway that never auto-respawns, and apt prompts that hang non-interactive scripts, a naive "apt upgrade && hermes update" breaks the agent in at least four distinct ways.
+
+This project encodes the working order of operations, the repair paths for each failure mode, and wraps it all in a script that runs automatically — notifying you only when something goes wrong.
+
+## Uninstall
+
+```bash
+sudo systemctl disable --now controlled-system-update.timer
+sudo rm /usr/local/bin/auto-update.sh
+sudo rm /etc/systemd/system/controlled-system-update.{service,timer}
+sudo systemctl daemon-reload
+sudo rm -rf /etc/controlled-system-update /var/log/controlled-system-update
+```
 
 ## License
 
