@@ -48,7 +48,10 @@ LOCK_TIMEOUT="${LOCK_TIMEOUT:-3600}"  # 1 hour max
 PKG_HOLDS="${PKG_HOLDS:-}"
 
 # Whether to reboot if required (auto-reboot)
-AUTO_REBOOT="${AUTO_REBOOT:-false}"
+AUTO_REBOOT="${AUTO_REBOOT:-true}"
+
+# Delay (in minutes) before auto-reboot — gives time for notification and graceful shutdown
+REBOOT_DELAY="${REBOOT_DELAY:-5}"
 
 # Whether to update Docker images
 UPDATE_DOCKER="${UPDATE_DOCKER:-true}"
@@ -195,9 +198,16 @@ update_os_packages() {
     if [[ -f /var/run/reboot-required ]]; then
         log_warn "System reboot is required"
         if [[ "$AUTO_REBOOT" == "true" ]]; then
-            log_info "AUTO_REBOOT=true, scheduling reboot..."
-            add_warning "OS" "Reboot required and will be triggered automatically"
-            shutdown -r +5 "Automatic reboot after system update" 2>/dev/null || true
+            log_info "AUTO_REBOOT=true, scheduling reboot in ${REBOOT_DELAY} minutes..."
+            add_warning "OS" "Reboot required — auto-reboot scheduled in ${REBOOT_DELAY} minutes"
+            # Send immediate Telegram notification about pending reboot
+            local reboot_msg
+            reboot_msg="<b>[${HOSTNAME_LABEL}] Reboot Scheduled</b>"
+            reboot_msg+="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+            reboot_msg+="\n<b>[OS]</b> Reboot required after system update — auto-rebooting in ${REBOOT_DELAY} minutes."
+            reboot_msg+="\nServices will restart automatically after reboot."
+            notify_telegram "$reboot_msg"
+            shutdown -r "+${REBOOT_DELAY}" "Automatic reboot after system update" 2>/dev/null || true
         else
             add_warning "OS" "Reboot required but AUTO_REBOOT=false - manual reboot needed"
         fi

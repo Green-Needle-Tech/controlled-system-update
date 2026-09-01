@@ -2,7 +2,7 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) on a root-host git-clone deployment with Docker services.
 
-**v2.0.0** — Now with fully automatic unattended updates and Telegram failure-only notification.
+**v2.1.0** — Now with fully automatic unattended updates, auto-reboot when required, and Telegram failure-only notification.
 
 ## What It Updates
 
@@ -86,8 +86,12 @@ UPDATE_PYTHON="true"
 # Packages to hold (never auto-upgrade)
 PKG_HOLDS=""
 
-# Auto-reboot if required
-AUTO_REBOOT="false"
+# Auto-reboot if required (default: true)
+# A Telegram notification is sent before rebooting
+AUTO_REBOOT="true"
+
+# Delay (in minutes) before auto-reboot — cancel with `shutdown -c`
+REBOOT_DELAY="5"
 
 # Hermes paths (adjust for non-standard installs)
 HERMES_DIR="/usr/local/lib/hermes-agent"
@@ -142,6 +146,7 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 - **Config preservation** — dpkg options preserve existing config files
 - **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
 - **Memory limit** — 1G cap on systemd service
+- **Auto-reboot** — reboots automatically when `/var/run/reboot-required` is present (default: enabled), with configurable delay and pre-reboot Telegram notification
 - **Health checks** — systemd failed units, Docker status, Hermes gateway, disk/memory/load
 - **Hermes-safe** — git stash/pop preserves local mods, gateway restart + dashboard rebuild
 - **Docker-safe** — pulls images, recreates via compose, prunes dangling images

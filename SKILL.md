@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Automatic + staged OS, Docker, and Hermes updates with Telegram failure-only notification."
 author: Liew Wei Sung (Green-Needle-Tech)
-version: 2.0.2
+version: 2.1.0
 ---
 
 # Controlled System Update
@@ -63,7 +63,8 @@ Key settings:
 - `TG_BOT_TOKEN` / `TG_CHAT_ID` — Telegram notification target (required for notifications)
 - `UPDATE_DOCKER` / `UPDATE_HERMES` / `UPDATE_SNAP` / `UPDATE_NPM` / `UPDATE_PYTHON` — toggle each phase (true/false)
 - `PKG_HOLDS` — space-separated packages to exclude from upgrades
-- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: false)
+- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: true)
+- `REBOOT_DELAY` — minutes to wait before auto-reboot (default: 5, cancel with `shutdown -c`)
 - `HERMES_DIR` / `UV_BIN` / `HERMES_CLI` — paths for non-standard installations
 
 ### Manual operations

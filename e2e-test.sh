@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e-test.sh — End-to-end test for controlled-system-update v2.0.0
+# e2e-test.sh — End-to-end test for controlled-system-update v2.1.0
 # Tests: file layout, config, systemd units, script execution, Telegram,
 # lock file, logging, health checks, failure notification path
 #
@@ -16,7 +16,7 @@ fail() { echo "FAIL  $1"; FAIL=$((FAIL + 1)); FAILURES+="\n  - $1"; }
 warn() { echo "WARN  $1"; WARN=$((WARN + 1)); }
 
 echo "=========================================="
-echo "E2E Test: controlled-system-update v2.0.0"
+echo "E2E Test: controlled-system-update v2.1.0"
 echo "Host: $(hostname -s)"
 echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "=========================================="
@@ -83,10 +83,10 @@ done
 
 # SKILL.md version
 skill_version=$(grep '^version:' "$REPO/SKILL.md" | sed 's/version: *//' | tr -d '"')
-if [[ "$skill_version" == "2.0.0" ]]; then
-    pass "SKILL.md version is 2.0.0"
+if [[ "$skill_version" == "2.1.0" ]]; then
+    pass "SKILL.md version is 2.1.0"
 else
-    fail "SKILL.md version is '$skill_version' (expected 2.0.0)"
+    fail "SKILL.md version is '$skill_version' (expected 2.1.0)"
 fi
 
 # ─── 3. Config Content ───────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ TG_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT="$TG_CHAT_ID"
 
 # Test 6a: Success message
-test_msg="[E2E TEST] controlled-system-update v2.0.0 — test notification from $(hostname -s)"
+test_msg="[E2E TEST] controlled-system-update v2.1.0 — test notification from $(hostname -s)"
 http_code=$(curl -s -o /tmp/tg_test_response.json -w '%{http_code}' \
     -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
     -d "chat_id=${TG_CHAT}" \
@@ -427,10 +427,10 @@ echo "--- 12. Local Skill Updated ---"
 local_skill="/root/.hermes/skills/devops/controlled-system-update/SKILL.md"
 if [[ -f "$local_skill" ]]; then
     local_skill_version=$(grep '^version:' "$local_skill" | sed 's/version: *//' | tr -d '"')
-    if [[ "$local_skill_version" == "2.0.0" ]]; then
-        pass "Local skill updated to v2.0.0"
+    if [[ "$local_skill_version" == "2.1.0" ]]; then
+        pass "Local skill updated to v2.1.0"
     else
-        fail "Local skill version is '$local_skill_version' (expected 2.0.0)"
+        fail "Local skill version is '$local_skill_version' (expected 2.1.0)"
     fi
 else
     fail "Local skill file missing at $local_skill"
