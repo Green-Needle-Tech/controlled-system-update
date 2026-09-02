@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 2.4.0
+version: 2.5.0
 platforms: [linux]
 metadata:
   hermes:
@@ -78,7 +78,8 @@ Key settings:
 - `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages)
 - `AUTO_REMOVE` — run `apt-get autoremove` (default: false — opt-in)
 - `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
-- `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_CLI` — auto-detected at runtime (CLI on PATH/common locations; user home from the running gateway process owner); set only for non-standard installations (e.g. Hermes installed under `/home/ubuntu` where detection fails)
+- `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_USER` / `HERMES_CLI` — auto-detected at runtime (CLI on PATH/common locations; user home from the running gateway process owner; user from the home's owner); set only for non-standard installations (e.g. Hermes installed under `/home/ubuntu` where detection fails)
+- Privilege drop: when the service runs as root but Hermes is owned by a regular user (e.g. `/home/ubuntu`), all hermes commands run as that user via `runuser` — avoids git's "dubious ownership" error without weakening `safe.directory`
 - `HERMES_UPDATE_TIMEOUT` — timeout for `hermes update` in seconds (default: 1800)
 - `HERMES_SKILLS_MODE` — external skill update mode: `off`, `check` (default), `update`
 - `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
@@ -369,6 +370,7 @@ not automatically force replacement of local edits.
 - snap refresh can hold locks — non-fatal warning only
 - Invoking a gateway restart from an active Hermes conversation may disconnect that conversation
 - Do not use `--force` with `hermes skills update` — locally modified hub skills are intentionally preserved
+- Root running git in a user-owned checkout fails with "dubious ownership" — never fix with a global `safe.directory=*`; the script's runuser privilege drop is the correct fix
 
 ## Related Skills
 

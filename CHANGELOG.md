@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [2.5.0] - 2026-09-03
+
+### Fixed
+- `hermes update` no longer fails with git's "dubious ownership" error when the systemd service runs as root but the hermes-agent git repo is owned by a regular user (e.g. `/home/ubuntu`): all hermes invocations now run as the repo-owning user via `runuser` privilege drop instead of weakening git's `safe.directory` protection
+- `timeout` no longer fails with "failed to run command 'hermes_privileged_cmd'" — the privilege wrapper now encloses `timeout` (a shell function cannot be exec'd by `timeout(1)`)
+
+### Added
+- `HERMES_USER` auto-detection (owner of the resolved Hermes user home) with config/env override
+- uv tool updates also run as the Hermes user — root-owned files in a user home cause later breakage
+- Update log now records which user the Hermes updater runs as
+
 ## [2.4.0] - 2026-09-03
 
 ### Changed
