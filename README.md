@@ -2,7 +2,7 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v2.4.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime — works for root and regular-user installs (e.g. /home/ubuntu) with zero config.
+**v2.5.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime, and all hermes commands run as the repo-owning user via `runuser` — fixes git's "dubious ownership" error when the systemd service runs as root but Hermes is installed for a regular user (e.g. /home/ubuntu).
 
 ## What It Updates
 

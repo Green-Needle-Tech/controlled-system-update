@@ -42,9 +42,9 @@ TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 HOSTNAME_LABEL="${HOSTNAME_LABEL:-$(hostname -s)}"
 
-# Paths (Hermes deployment profile)
+# Paths and privilege (Hermes deployment profile)
 # Hermes may be installed for root or for a regular user (e.g. /home/ubuntu).
-# All three paths are auto-detected at runtime; any value set in the config
+# All paths are auto-detected at runtime; any value set in the config
 # file or environment takes precedence over detection.
 #
 # Detection order:
@@ -52,6 +52,13 @@ HOSTNAME_LABEL="${HOSTNAME_LABEL:-$(hostname -s)}"
 #   HERMES_USER_HOME: config/env -> user owning the running gateway process
 #                     -> user owning the CLI binary -> /root
 #   HERMES_HOME:      config/env -> ${HERMES_USER_HOME}/.hermes
+#   HERMES_USER:      config/env -> owner of ${HERMES_USER_HOME} -> root
+#
+# Privilege drop: when this script runs as root but Hermes is owned by a
+# regular user, all hermes invocations run as that user via runuser(1).
+# Running git as root inside a user-owned checkout triggers git's
+# "dubious ownership" protection (safe.directory); running as the owner
+# avoids it entirely without weakening git's security defaults.
 detect_hermes_cli() {
     local candidate
     if command -v hermes &>/dev/null; then
@@ -121,6 +128,32 @@ fi
 if [[ -z "${HERMES_HOME:-}" ]]; then
     HERMES_HOME="${HERMES_USER_HOME}/.hermes"
 fi
+
+# Resolve the user Hermes runs as. When this script runs as root (e.g. via
+# the systemd service) but Hermes is installed for a regular user, hermes
+# commands must run as that user: git refuses to operate on a repo owned
+# by a different user ("dubious ownership") and `hermes update` runs git
+# inside the installation checkout.
+if [[ -z "${HERMES_USER:-}" ]]; then
+    HERMES_USER=""
+    if [[ -n "$HERMES_USER_HOME" ]]; then
+        HERMES_USER="$(stat -c '%U' "$HERMES_USER_HOME" 2>/dev/null || true)"
+    fi
+    if [[ -z "$HERMES_USER" || "$HERMES_USER" == "UNKNOWN" ]]; then
+        HERMES_USER="root"
+    fi
+fi
+
+# runuser wrapper: run a command as $HERMES_USER when privilege drop is
+# needed. As root with a non-root HERMES_USER, uses runuser -u (no PAM
+# password prompt). Otherwise runs the command directly.
+hermes_privileged_cmd() {
+    if [[ $EUID -eq 0 && "$HERMES_USER" != "root" ]] && command -v runuser &>/dev/null; then
+        runuser -u "$HERMES_USER" -- "$@"
+    else
+        "$@"
+    fi
+}
 HERMES_UPDATE_TIMEOUT="${HERMES_UPDATE_TIMEOUT:-1800}"
 
 # Hermes external skill update mode
@@ -488,14 +521,16 @@ update_docker_images() {
 }
 
 run_hermes() {
-    env \
+    hermes_privileged_cmd env \
         HOME="$HERMES_USER_HOME" \
         HERMES_HOME="$HERMES_HOME" \
         "$HERMES_CLI" "$@"
 }
 
 run_hermes_with_timeout() {
-    timeout \
+    # hermes_privileged_cmd must wrap timeout (not the other way round):
+    # timeout(1) execs its argument, and a shell function is not a binary.
+    hermes_privileged_cmd timeout \
         --signal=TERM \
         --kill-after=30s \
         "$HERMES_SKILLS_TIMEOUT" \
@@ -522,12 +557,14 @@ update_hermes_agent() {
     old_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
     log_info "Current Hermes version: $old_version"
 
-    log_info "Running supported Hermes updater..."
-    if ! timeout \
+    log_info "Running supported Hermes updater (as user: $HERMES_USER)..."
+    if ! hermes_privileged_cmd timeout \
         --signal=TERM \
         --kill-after=30s \
         "$HERMES_UPDATE_TIMEOUT" \
-        env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+        env \
+        HOME="$HERMES_USER_HOME" \
+        HERMES_HOME="$HERMES_HOME" \
         "$HERMES_CLI" update --yes >>"$LOG_FILE" 2>&1; then
         add_error "Hermes" "hermes update failed or timed out"
         log_error "Hermes update failed"
@@ -659,11 +696,14 @@ update_python_packages() {
         return 0
     fi
 
-    # Update uv-managed tools if any
+    # Update uv-managed tools if any (run as HERMES_USER — tools live in
+    # the user's home, and root-owned files in a user home cause breakage)
     log_info "Updating uv-installed tools..."
-    if "$uv_bin" tool list --format json 2>/dev/null | grep -q '"name"'; then
+    if hermes_privileged_cmd env HOME="$HERMES_USER_HOME" \
+        "$uv_bin" tool list --format json 2>/dev/null | grep -q '"name"'; then
         local tools
-        tools="$("$uv_bin" tool list --format json 2>/dev/null | python3 -c "
+        tools="$(hermes_privileged_cmd env HOME="$HERMES_USER_HOME" \
+            "$uv_bin" tool list --format json 2>/dev/null | python3 -c "
 import sys, json
 try:
     for t in json.load(sys.stdin):
@@ -674,7 +714,9 @@ except Exception:
         if [[ -n "$tools" ]]; then
             for tool in $tools; do
                 log_info "Updating tool: $tool"
-                "$uv_bin" tool upgrade "$tool" >> "$LOG_FILE" 2>&1 || \
+                hermes_privileged_cmd env HOME="$HERMES_USER_HOME" \
+                    "$uv_bin" tool upgrade "$tool" >> "$LOG_FILE" 2>&1 || \
+                    hermes_privileged_cmd env HOME="$HERMES_USER_HOME" \
                     "$uv_bin" tool install "$tool" >> "$LOG_FILE" 2>&1 || true
             done
         fi
