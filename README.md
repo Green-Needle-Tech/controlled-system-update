@@ -2,7 +2,7 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v2.3.0** — Production hardening: supported Hermes updater, external skill lifecycle, deferred reboot, config preservation, safer defaults, real flock tests.
+**v2.4.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime — works for root and regular-user installs (e.g. /home/ubuntu) with zero config.
 
 ## What It Updates
 
@@ -106,9 +106,10 @@ AUTO_REMOVE="false"
 # Delete log files older than N days (0 = disable)
 LOG_RETENTION_DAYS="30"
 
-# Hermes
-HERMES_HOME="/root/.hermes"
-HERMES_CLI="/usr/local/bin/hermes"
+# Hermes — paths auto-detected; uncomment only if detection fails
+# HERMES_HOME="/root/.hermes"
+# HERMES_USER_HOME="/root"
+# HERMES_CLI="/usr/local/bin/hermes"
 HERMES_UPDATE_TIMEOUT="1800"
 
 # Hermes external skills: off, check (default), update
