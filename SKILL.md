@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 2.3.0
+version: 2.4.0
 platforms: [linux]
 metadata:
   hermes:
@@ -78,7 +78,7 @@ Key settings:
 - `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages)
 - `AUTO_REMOVE` — run `apt-get autoremove` (default: false — opt-in)
 - `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
-- `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_CLI` — paths for non-standard installations
+- `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_CLI` — auto-detected at runtime (CLI on PATH/common locations; user home from the running gateway process owner); set only for non-standard installations (e.g. Hermes installed under `/home/ubuntu` where detection fails)
 - `HERMES_UPDATE_TIMEOUT` — timeout for `hermes update` in seconds (default: 1800)
 - `HERMES_SKILLS_MODE` — external skill update mode: `off`, `check` (default), `update`
 - `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)

@@ -43,9 +43,84 @@ TG_CHAT_ID="${TG_CHAT_ID:-}"
 HOSTNAME_LABEL="${HOSTNAME_LABEL:-$(hostname -s)}"
 
 # Paths (Hermes deployment profile)
-HERMES_HOME="${HERMES_HOME:-/root/.hermes}"
-HERMES_USER_HOME="${HERMES_USER_HOME:-/root}"
-HERMES_CLI="${HERMES_CLI:-/usr/local/bin/hermes}"
+# Hermes may be installed for root or for a regular user (e.g. /home/ubuntu).
+# All three paths are auto-detected at runtime; any value set in the config
+# file or environment takes precedence over detection.
+#
+# Detection order:
+#   HERMES_CLI:       config/env -> `hermes` on PATH -> common install locations
+#   HERMES_USER_HOME: config/env -> user owning the running gateway process
+#                     -> user owning the CLI binary -> /root
+#   HERMES_HOME:      config/env -> ${HERMES_USER_HOME}/.hermes
+detect_hermes_cli() {
+    local candidate
+    if command -v hermes &>/dev/null; then
+        command -v hermes
+        return 0
+    fi
+    for candidate in \
+        /usr/local/bin/hermes \
+        /usr/bin/hermes \
+        /opt/hermes/bin/hermes \
+        /root/.local/bin/hermes \
+        /home/*/.local/bin/hermes; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolve the home directory of a UID via getent passwd
+home_of_uid() {
+    local uid="$1"
+    if [[ -n "$uid" ]] && command -v getent &>/dev/null; then
+        getent passwd "$uid" 2>/dev/null | cut -d: -f6
+    fi
+}
+
+detect_hermes_user_home() {
+    local cli="$1" uid home gw_pid
+    # Strongest signal: the user the gateway process actually runs as.
+    # Multiple processes may match (wrappers, log tails) — take the first
+    # match that resolves to a real user home.
+    while IFS= read -r gw_pid; do
+        [[ -z "$gw_pid" ]] && continue
+        uid="$(ps -o uid= -p "$gw_pid" 2>/dev/null | tr -d ' ' || true)"
+        home="$(home_of_uid "$uid")"
+        if [[ -n "$home" ]]; then
+            printf '%s\n' "$home"
+            return 0
+        fi
+    done < <(pgrep -f 'hermes.*gateway' 2>/dev/null || true)
+    # Fall back to the user owning the CLI binary
+    uid="$(stat -c '%u' "$cli" 2>/dev/null || true)"
+    home="$(home_of_uid "$uid")"
+    if [[ -n "$home" ]]; then
+        printf '%s\n' "$home"
+        return 0
+    fi
+    return 1
+}
+
+if [[ -z "${HERMES_CLI:-}" ]]; then
+    HERMES_CLI="$(detect_hermes_cli)" || HERMES_CLI=""
+fi
+
+if [[ -z "${HERMES_USER_HOME:-}" ]]; then
+    HERMES_USER_HOME=""
+    if [[ -n "$HERMES_CLI" ]]; then
+        HERMES_USER_HOME="$(detect_hermes_user_home "$HERMES_CLI")" || HERMES_USER_HOME=""
+    fi
+    if [[ -z "$HERMES_USER_HOME" ]]; then
+        HERMES_USER_HOME="/root"
+    fi
+fi
+
+if [[ -z "${HERMES_HOME:-}" ]]; then
+    HERMES_HOME="${HERMES_USER_HOME}/.hermes"
+fi
 HERMES_UPDATE_TIMEOUT="${HERMES_UPDATE_TIMEOUT:-1800}"
 
 # Hermes external skill update mode
@@ -576,6 +651,9 @@ update_python_packages() {
         return 0
     fi
     local uv_bin="${UV_BIN:-${HERMES_USER_HOME}/.local/bin/uv}"
+    if [[ ! -x "$uv_bin" ]] && command -v uv &>/dev/null; then
+        uv_bin="$(command -v uv)"
+    fi
     if [[ ! -x "$uv_bin" ]]; then
         log_info "uv not found, skipping Python package updates"
         return 0

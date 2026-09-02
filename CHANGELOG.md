@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [2.4.0] - 2026-09-03
+
+### Changed
+- Hermes paths (`HERMES_CLI`, `HERMES_USER_HOME`, `HERMES_HOME`) are now auto-detected at runtime instead of defaulting to `/root` — works out of the box on hosts where Hermes runs as a regular user (e.g. `/home/ubuntu`)
+- Detection order: CLI from PATH then common install locations; user home from the running gateway process owner, then the CLI binary owner; `HERMES_HOME` defaults to `<user home>/.hermes
+- Config/env values override detection; the shipped config template no longer hardcodes `/root` paths
+- `uv` lookup falls back to `uv` on PATH when not under `HERMES_USER_HOME/.local/bin`
+
+### Fixed
+- e2e-test.sh no longer hardcodes `/root/.hermes` for the local skill check
+
 ## [2.3.0] - 2026-09-02
 
 ### Added
