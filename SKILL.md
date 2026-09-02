@@ -1,29 +1,37 @@
 ---
 name: controlled-system-update
-description: "Automatic + staged OS, Docker, and Hermes updates with Telegram failure-only notification."
-author: Liew Wei Sung (Green-Needle-Tech)
-version: 2.2.0
+description: "Safely stage and verify Linux, Docker, and Hermes updates"
+author: Green-Needle-Tech
+version: 2.3.0
+platforms: [linux]
+metadata:
+  hermes:
+    category: devops
+    tags: [linux, apt, docker, updates, sre, hermes]
+    requires_toolsets: [terminal]
 ---
 
 # Controlled System Update
 
-Expert Linux sysadmin/SRE procedure for comprehensive server updates: OS packages, Snap, Docker images, Hermes Agent, Python/uv tools, and npm globals. Two modes: **automatic** (daily, unattended, Telegram on failure only) and **manual** (staged, compatibility-checked, interactive).
+Expert Linux sysadmin/SRE procedure for comprehensive server updates: OS packages, Snap, Docker images, Hermes Agent (via supported updater), Hermes hub skills, and optional Python/uv tools and npm globals. Two modes: **automatic** (daily, unattended, Telegram on failure only) and **manual** (staged, compatibility-checked, interactive).
 
 ## When to Use
 
-- David asks to update the server, run a controlled update, or update OS/Hermes/Docker
-- Automatic mode is already installed and David wants to check/modify it
+- User asks to update the server, run a controlled update, or update OS/Hermes/Docker
+- Automatic mode is already installed and user wants to check/modify it
 - A Hermes release notes breaking changes and a manual update is planned
-- Don't use for: skills/plugins updates, routine diagnostics (`host-maintenance`)
+- Don't use for: routine diagnostics, ad-hoc package installs
 
-## Deployment Profile (this host)
+## Deployment Example (host-specific)
+
+The following is an example deployment profile. Adjust paths and services for your specific host.
 
 - OS: Ubuntu, kernel 6.8, package manager `apt`
-- Hermes: root-host git-clone at `/usr/local/lib/hermes-agent` (NOT Docker, NOT pip)
-- Venv: `/usr/local/lib/hermes-agent/venv/` managed by `uv` (`~/.local/bin/uv`) — no pip binary
-- CLI: `/usr/local/bin/hermes` wrapper
-- Gateway: `hermes gateway run --replace`, NO auto-respawn — manual restart after any kill
-- Dashboard: systemd `hermes-dashboard` on port 9119, needs `npm run build` after Hermes updates
+- Hermes: root-host git-clone at `/usr/local/lib/hermes-agent`
+- Venv: managed by `uv` — no pip binary
+- CLI: `/usr/local/bin/hermes`
+- Gateway: `hermes gateway run --replace`
+- Dashboard: systemd `hermes-dashboard` on port 9119
 - Docker: BunkerWeb WAF + internal services
 - Telegram: bot token + chat ID in `/etc/controlled-system-update/auto-update.conf`
 
@@ -31,14 +39,15 @@ Expert Linux sysadmin/SRE procedure for comprehensive server updates: OS package
 
 Runs daily at 04:00 via systemd timer. No user intervention. Telegram notification ONLY on failure or warnings.
 
-### What gets updated automatically
+### What gets updated automatically (defaults)
 
-1. **OS packages** — apt update + upgrade + dist-upgrade + autoremove + autoclean
+1. **OS packages** — apt update + upgrade (dist-upgrade, autoremove, and auto-reboot are opt-in)
 2. **Snap packages** — snap refresh (if snap is installed)
-3. **Docker images** — pulls latest images for all running containers, recreates via docker-compose if image changed, prunes dangling images
-4. **Hermes Agent** — git stash + pull + stash pop + uv sync + gateway restart + dashboard rebuild
-5. **Python/uv tools** — upgrades all uv-installed CLI tools
-6. **npm global packages** — npm update -g
+3. **Docker images** — pulls latest images for all running containers, recreates via Compose if changed, prunes dangling images
+4. **Hermes Agent** — `hermes update --yes` (supported updater handles deps, backups, service discovery, bundled-skill sync)
+5. **Hermes hub skills** — `hermes skills check` (conservative default; `update` mode installs available updates)
+6. **Python/uv tools** — opt-in only (`UPDATE_PYTHON=true`)
+7. **npm global packages** — opt-in only (`UPDATE_NPM=true`)
 
 ### Installation
 
@@ -61,19 +70,37 @@ Config file: `/etc/controlled-system-update/auto-update.conf`
 
 Key settings:
 - `TG_BOT_TOKEN` / `TG_CHAT_ID` — Telegram notification target (required for notifications)
-- `UPDATE_DOCKER` / `UPDATE_HERMES` / `UPDATE_SNAP` / `UPDATE_NPM` / `UPDATE_PYTHON` — toggle each phase (true/false)
+- `UPDATE_DOCKER` / `UPDATE_HERMES` / `UPDATE_SNAP` — toggle each phase (default: true)
+- `UPDATE_NPM` / `UPDATE_PYTHON` — opt-in phases (default: false — not OS maintenance)
 - `PKG_HOLDS` — space-separated packages to exclude from upgrades
-- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: true)
+- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: false — opt-in)
 - `REBOOT_DELAY` — minutes to wait before auto-reboot (default: 5, cancel with `shutdown -c`)
-- `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages, riskier)
+- `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages)
+- `AUTO_REMOVE` — run `apt-get autoremove` (default: false — opt-in)
 - `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
-- `HERMES_DIR` / `UV_BIN` / `HERMES_CLI` — paths for non-standard installations
+- `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_CLI` — paths for non-standard installations
+- `HERMES_UPDATE_TIMEOUT` — timeout for `hermes update` in seconds (default: 1800)
+- `HERMES_SKILLS_MODE` — external skill update mode: `off`, `check` (default), `update`
+- `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
+- `HERMES_SKILLS_SCOPE` — include all Hermes-managed sources: GitHub, URL, tap, hub, community (default: all)
+- `HERMES_SKILLS_TIMEOUT` — timeout for skill operations in seconds (default: 600)
 
 ### Manual operations
 
 ```bash
 # Run update immediately
 sudo /usr/local/bin/auto-update.sh
+
+# Trigger via systemd (preferred)
+sudo systemctl start controlled-system-update.service
+
+# Inspect the run independently
+systemctl show controlled-system-update.service \
+    --property=ActiveState,SubState,Result,ExecMainStatus
+
+journalctl -u controlled-system-update.service \
+    --since today \
+    --no-pager
 
 # Check timer status
 systemctl status controlled-system-update.timer
@@ -85,9 +112,6 @@ systemctl list-timers controlled-system-update
 journalctl -u controlled-system-update -f
 # or
 tail -f /var/log/controlled-system-update/last-run.log
-
-# Trigger via systemd
-sudo systemctl start controlled-system-update.service
 
 # Disable automatic updates
 sudo systemctl disable --now controlled-system-update.timer
@@ -109,17 +133,21 @@ sudo systemctl enable --now controlled-system-update.timer
 - Package holds respected (apt-mark hold)
 - Low priority (Nice=10, CPUWeight=50) — won't starve production services
 - Memory limit (1G) on systemd service
+- `Umask=0077` on systemd service — restricts file creation permissions
 - `needrestart` integration: auto-restarts services after library upgrades (if installed)
 - Log rotation: auto-deletes log files older than `LOG_RETENTION_DAYS` (default: 30)
-- Pre-reboot graceful shutdown: stops Docker containers and Hermes gateway before `shutdown`
+- `last-run.log` is a symlink to the most recent run's log file
 - Post-update health checks: systemd failed units, Docker container status, Hermes gateway, disk/memory/load
-- Hermes git stash/pop preserves local modifications
-- Dashboard rebuilt + restarted after Hermes updates
+- Reboot scheduling deferred to end of run — services are not stopped prematurely
+- Hermes updated via supported `hermes update --yes` (not custom git/uv logic)
+- Hermes hub skills updated via `hermes skills check/update` (never `--force`)
+- Configuration secrets are not exported to child processes (no `set -a`)
+- Configuration ownership and permissions validated before sourcing
 - GitHub Actions CI with ShellCheck linting on every push
 
 ## Mode 2 — Manual Controlled Update (SRE procedure)
 
-For when David wants a human-in-the-loop update with compatibility pre-checks. Use when a major Hermes release is pending or when evaluating breaking changes.
+For when a human-in-the-loop update with compatibility pre-checks is needed. Use when a major Hermes release is pending or when evaluating breaking changes.
 
 ### Phase 1 — Pre-Check & Compatibility Evaluation (no upgrades yet)
 
@@ -131,8 +159,6 @@ cat /etc/os-release | head -2
 apt-get --version | head -1
 node --version; python3 --version
 hermes --version
-cd /usr/local/lib/hermes-agent && git log -1 --format='%h %s (%ci)'
-git status --short                          # local modifications (stash targets)
 hermes update --check                       # commits behind
 
 # 1.2 Runtime requirements
@@ -143,7 +169,7 @@ grep -E 'requires-python|python' /usr/local/lib/hermes-agent/pyproject.toml | he
 # flag: minimum Python/Node bumps, new daemon deps, config schema changes
 ```
 
-Then summarize the dependency graph and state explicitly whether `apt upgrade` risks Hermes. Watch items: Python minor/major bumps, libc6/openssl, systemd, docker.io, nodejs. Present findings + planned commands to David before executing — production-host package updates require his approval.
+Then summarize the dependency graph and state explicitly whether `apt upgrade` risks Hermes. Watch items: Python minor/major bumps, libc6/openssl, systemd, docker.io, nodejs. Present findings + planned commands before executing — production-host package updates require explicit approval.
 
 ### Phase 2 — Dry Run & Simulation
 
@@ -157,59 +183,50 @@ apt-get upgrade --simulate 2>/dev/null | grep -c '^Inst '   # total count
 
 ### Phase 3 — Staged Execution
 
-### 3.1 OS update
+#### 3.1 OS update
 
 ```bash
 DEBIAN_FRONTEND=noninteractive apt-get update
 ```
 
-### 3.2 OS package upgrades (preserve configs, no prompts)
+#### 3.2 OS package upgrades (preserve configs, no prompts)
 
 ```bash
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
   -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
-  -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
-DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
 ```
 
 Completion criterion: exit 0, no dpkg errors, `apt-get upgrade --simulate` now reports 0.
 
-### 3.3 Hermes Agent update
+#### 3.3 Hermes Agent update
 
-Running INSIDE an agent session (the normal case): `hermes update` restarts the gateway, which kills the running agent mid-run — use the manual git path:
+Running INSIDE an agent session (the normal case): `hermes update` restarts the gateway, which kills the running agent mid-run — background it so it owns its own gateway restart:
 
 ```bash
-cd /usr/local/lib/hermes-agent
-git stash push -m "pre-update-$(date +%Y%m%d-%H%M)"
-git pull origin main
-git stash pop
+setsid nohup hermes update --yes > /tmp/hermes-update.log 2>&1 & disown
 ```
 
-Running from a plain terminal (no active session): background it so it owns its own gateway restart:
+Running from a plain terminal (no active session):
 
 ```bash
-setsid nohup hermes update --yes --no-backup > /tmp/hermes-update.log 2>&1 & disown
+hermes update --yes
 ```
 
-Completion criterion: `git log -1` shows the new upstream commit; `git status --short` matches the pre-check local-mods list.
+Completion criterion: `hermes --version` shows the new version; `hermes doctor` passes.
 
-### 3.4 Rebuild runtime deps (if pyproject/lockfile changed)
+#### 3.4 Rebuild runtime deps (if pyproject/lockfile changed)
+
+The supported `hermes update` handles dependency installation via lockfile-backed `uv sync`. Do not independently run `uv sync` or `uv pip install -e .` unless performing an explicitly documented recovery fallback.
+
+#### 3.5 Restart gateway + rebuild dashboard (after ANY Hermes update)
+
+Note: invoking a gateway restart from an active Hermes conversation may disconnect that conversation.
 
 ```bash
-~/.local/bin/uv sync
-~/.local/bin/uv pip install -e .
-```
-
-### 3.3.5 Restart gateway + rebuild dashboard (after ANY Hermes update)
-
-```bash
-kill -TERM $(pgrep -f "hermes.*gateway run") 2>/dev/null; sleep 3
-nohup hermes gateway run --replace >> ~/.hermes/logs/gateway-stdout.log 2>&1 &
+# If the updater did not restart the gateway automatically:
+hermes gateway run --replace
 sleep 5
 pgrep -f "hermes.*gateway run" && echo "Gateway OK" || echo "Gateway DOWN"
-cd /usr/local/lib/hermes-agent/web && npm run build
-systemctl restart hermes-dashboard
 ```
 
 ### Phase 4 — Post-Update Verification
@@ -221,27 +238,112 @@ hermes --version                                   # new version confirmed
 hermes doctor                                      # env, SSL, packages, API connectivity
 pgrep -f "hermes.*gateway run"                     # gateway alive
 docker ps -a --format "table {{.Names}}\t{{.Status}}"
-docker exec bunkerweb supervisorctl status         # boot-race FATAL check
 systemctl --failed
-curl -s http://localhost:9119/ -o /dev/null -w '%{http_code}\n'    # dashboard 200
-curl -s http://localhost:8888/health               # Hindsight
-curl -sf https://daviddigitalhub.cloud/health      # DDH
 free -h; df -h /
 ```
 
 Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) to prove tool calling, API connections, and core loop execution.
 
+## Updating Hermes Skills
+
+Hermes skills have separate update lifecycles.
+
+### Bundled skills
+
+Bundled skills are synchronized by the Hermes core updater:
+
+```bash
+hermes update --check
+hermes update --yes
+```
+
+Locally modified bundled skills are preserved.
+
+### Unofficial GitHub and other external skills
+
+Skills installed through the Hermes Skills Hub retain their source provenance.
+This includes unofficial GitHub repositories, custom GitHub taps, direct URLs,
+skills.sh, well-known endpoints, and community registries — anything installed
+via `hermes skills install` and tracked in `${HERMES_HOME}/skills/.hub/lock.json`.
+
+List and inspect tracked skills:
+
+```bash
+hermes skills list --source hub
+hermes skills check
+```
+
+Update all changed, provenance-tracked skills:
+
+```bash
+hermes skills update
+hermes skills audit
+```
+
+Update one specific GitHub-installed skill:
+
+```bash
+hermes skills update some-skill
+```
+
+Never use `--force` during unattended maintenance. Hermes normally skips a
+skill when its installed files have been edited locally. Forced updates may
+discard those edits.
+
+A skill copied or cloned manually into `~/.hermes/skills/` is not managed by
+the hub updater. Back it up and reinstall it once using its GitHub identifier:
+
+```bash
+hermes skills inspect owner/repository/skills/skill-name
+hermes skills install owner/repository/skills/skill-name
+```
+
+All community skills must pass Hermes security scanning before installation.
+A successful update does not imply that the upstream project is trustworthy;
+review source changes and audit results before enabling automatic updates.
+
+### Optional required-skill inventory
+
+Create `/etc/controlled-system-update/hermes-skills.conf` to declare required
+GitHub skills. The update script reports missing skills as warnings — it does
+not silently install new third-party code during a system update.
+
+```bash
+HERMES_REQUIRED_GITHUB_SKILLS=(
+    "Green-Needle-Tech/controlled-system-update"
+    "some-owner/some-repository/skills/some-skill"
+)
+```
+
+### Installing this project's own skill
+
+Install it with tracked provenance rather than copying it manually:
+
+```bash
+hermes skills install \
+  https://raw.githubusercontent.com/Green-Needle-Tech/controlled-system-update/main/SKILL.md \
+  --category devops \
+  --yes
+```
+
+Subsequent releases can then be applied through:
+
+```bash
+hermes skills update controlled-system-update
+```
+
+If the existing local skill was manually copied and therefore has no hub
+provenance, perform one reviewed migration with `hermes skills install`; do
+not automatically force replacement of local edits.
+
 ## Repair Playbook (non-destructive)
 
 | Symptom | Fix |
 |---|---|
-| Gateway DOWN after restart | `nohup hermes gateway run --replace &`, verify with pgrep |
-| `git stash pop` conflict | resolve manually, then `git stash drop`; never force |
-| venv import errors | `uv sync && uv pip install -e .` |
-| Dashboard "frontend not built" crash | `cd web && npm run build && systemctl restart hermes-dashboard` |
+| Gateway DOWN after restart | `hermes gateway run --replace`, verify with pgrep |
+| venv import errors | `hermes doctor` or `hermes update --yes` (recovery) |
 | Broken apt package | pin: `apt-get install <pkg>=<oldver>`; hold: `apt-mark hold <pkg>` |
-| BunkerWeb FATAL after reboot | `docker exec bunkerweb supervisorctl start bunkerweb` |
-| Lock file stuck | `rm /var/lock/controlled-system-update.lock` |
+| Lock file stuck | Verify ownership with `lslocks` or `flock -n`; do NOT blindly delete the lock file — the kernel-held lock, not file existence, determines ownership |
 | Telegram not sending | Check TG_BOT_TOKEN/TG_CHAT_ID in config, test with curl |
 
 ## Output Format
@@ -260,15 +362,13 @@ Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) t
 
 ## Pitfalls
 
-- `hermes update` from inside an agent session kills the session (gateway restart) — manual git path only
-- `hermes update` can hang >5min on TTY prompts — always `--yes --no-backup`, background it, check `~/.hermes/logs/update.log`
-- venv has NO pip — `uv` only
-- Gateway never auto-respawns on this host — every kill needs a manual start + pgrep verify
+- `hermes update` from inside an agent session kills the session (gateway restart) — background it
+- `hermes update` can hang on TTY prompts — always use `--yes`
 - apt prompts hang scripts — always DEBIAN_FRONTEND=noninteractive + force-confdef/confold
-- Hermes update stops the dashboard — always rebuild + restart it after
 - Docker image pulls can fail due to rate limits — script logs but doesn't fail the whole run
 - snap refresh can hold locks — non-fatal warning only
-- Full pitfall catalog: `host-maintenance` skill
+- Invoking a gateway restart from an active Hermes conversation may disconnect that conversation
+- Do not use `--force` with `hermes skills update` — locally modified hub skills are intentionally preserved
 
 ## Related Skills
 

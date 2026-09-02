@@ -26,16 +26,30 @@ echo "[1/5] Installing auto-update.sh to ${INSTALL_PREFIX}/bin/"
 install -Dm755 "${SCRIPT_DIR}/scripts/auto-update.sh" "${INSTALL_PREFIX}/bin/auto-update.sh"
 echo "  -> Installed ${INSTALL_PREFIX}/bin/auto-update.sh"
 
-# 2. Install config
-echo "[2/5] Installing config to ${CONFIG_DIR}/"
-if [[ -f "${CONFIG_DIR}/auto-update.conf" ]]; then
-    echo "  -> Config already exists, backing up..."
-    cp "${CONFIG_DIR}/auto-update.conf" "${CONFIG_DIR}/auto-update.conf.bak.$(date +%Y%m%d)"
+# 2. Install config — preserve existing configuration during reinstall
+echo "[2/5] Installing configuration"
+
+install -d -m 700 "$CONFIG_DIR"
+
+if [[ -e "${CONFIG_DIR}/auto-update.conf" ]]; then
+    # Existing config found — preserve it, install new template as .dist
+    install -m 600 \
+        "${SCRIPT_DIR}/config/auto-update.conf" \
+        "${CONFIG_DIR}/auto-update.conf.dist"
+
+    chmod 600 "${CONFIG_DIR}/auto-update.conf"
+
+    echo "  -> Existing configuration preserved"
+    echo "  -> New template installed as auto-update.conf.dist"
+else
+    install -m 600 \
+        "${SCRIPT_DIR}/config/auto-update.conf" \
+        "${CONFIG_DIR}/auto-update.conf"
+
+    echo "  -> Installed new configuration"
 fi
-install -Dm600 "${SCRIPT_DIR}/config/auto-update.conf" "${CONFIG_DIR}/auto-update.conf"
-chmod 600 "${CONFIG_DIR}/auto-update.conf"
-echo "  -> Installed ${CONFIG_DIR}/auto-update.conf (permissions: 600)"
-echo "  -> EDIT THIS FILE to set your Telegram bot token and chat ID!"
+
+echo "  -> EDIT ${CONFIG_DIR}/auto-update.conf to set your Telegram bot token and chat ID!"
 
 # 3. Install systemd units
 echo "[3/5] Installing systemd units"

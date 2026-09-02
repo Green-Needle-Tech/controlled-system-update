@@ -1,21 +1,25 @@
 # Controlled System Update
 
-A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) on a root-host git-clone deployment with Docker services.
+A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v2.2.0** — Hardened with atomic flock locking, needrestart integration, log rotation, GitHub Actions CI, and safer dist-upgrade defaults.
+**v2.3.0** — Production hardening: supported Hermes updater, external skill lifecycle, deferred reboot, config preservation, safer defaults, real flock tests.
 
 ## What It Updates
 
-The automatic mode updates **all software** on the server:
+The automatic mode updates the following by default:
 
-| Component | Method |
-|-----------|--------|
-| OS packages | apt update + upgrade + dist-upgrade + autoremove |
-| Snap packages | snap refresh |
-| Docker images | Pull latest for all running containers, recreate via compose if changed |
-| Hermes Agent | git stash + pull + stash pop + uv sync + gateway restart + dashboard rebuild |
-| Python/uv tools | uv tool upgrade (all installed tools) |
-| npm global packages | npm update -g |
+| Component | Method | Default |
+|-----------|--------|---------|
+| OS packages | apt update + upgrade | enabled |
+| Snap packages | snap refresh | enabled |
+| Docker images | Pull latest for running containers, recreate via Compose if changed | enabled |
+| Hermes Agent | `hermes update --yes` (supported updater) | enabled |
+| Hermes external skills | `hermes skills check` (report only) | enabled |
+| Python/uv tools | uv tool upgrade | **opt-in** |
+| npm global packages | npm update -g | **opt-in** |
+| dist-upgrade | apt-get dist-upgrade | **opt-in** |
+| autoremove | apt-get autoremove | **opt-in** |
+| auto-reboot | shutdown -r | **opt-in** |
 
 ## Two Modes
 
@@ -24,9 +28,10 @@ The automatic mode updates **all software** on the server:
 - Runs daily at 04:00 via systemd timer (with 30min random delay)
 - **No user intervention** — fully unattended
 - **Telegram notification ONLY on failure or warnings** — silent on success
-- Lock file prevents concurrent runs
+- Atomic flock locking prevents concurrent runs
 - Low system priority (Nice=10) — won't starve production services
 - Post-update health checks (systemd, Docker, Hermes gateway, disk/memory/load)
+- Reboot scheduling deferred to end of run — services are not stopped prematurely
 
 ### Manual Mode (SRE procedure)
 
@@ -51,12 +56,14 @@ sudo nano /etc/controlled-system-update/auto-update.conf
 # Set TG_BOT_TOKEN and TG_CHAT_ID for Telegram notifications
 ```
 
+Reinstalling preserves your existing configuration — the new template is installed as `auto-update.conf.dist` for reference.
+
 ### Requirements
 
 - Ubuntu/Debian host with `apt`
 - `curl` (for Telegram API)
 - Docker (optional — skipped if not installed)
-- Hermes Agent installed as git clone (optional — skipped if not found)
+- Hermes Agent (optional — skipped if CLI not found)
 - `uv` package manager (optional — for Python tool updates)
 - `npm` (optional — for global package updates)
 - A Telegram bot token and chat ID (for failure notifications)
@@ -80,28 +87,35 @@ TG_CHAT_ID="123456789"
 UPDATE_DOCKER="true"
 UPDATE_HERMES="true"
 UPDATE_SNAP="true"
-UPDATE_NPM="true"
-UPDATE_PYTHON="true"
+UPDATE_NPM="false"      # opt-in
+UPDATE_PYTHON="false"   # opt-in
 
 # Packages to hold (never auto-upgrade)
 PKG_HOLDS=""
 
-# Auto-reboot if required (default: true)
-# A Telegram notification is sent before rebooting
-AUTO_REBOOT="true"
-
-# Delay (in minutes) before auto-reboot — cancel with `shutdown -c`
+# Auto-reboot (opt-in, default: false)
+AUTO_REBOOT="false"
 REBOOT_DELAY="5"
 
-# dist-upgrade can remove packages (riskier) — default: false
+# dist-upgrade (opt-in, default: false)
 DIST_UPGRADE="false"
+
+# autoremove (opt-in, default: false)
+AUTO_REMOVE="false"
 
 # Delete log files older than N days (0 = disable)
 LOG_RETENTION_DAYS="30"
 
-# Hermes paths (adjust for non-standard installs)
-HERMES_DIR="/usr/local/lib/hermes-agent"
-UV_BIN="/root/.local/bin/uv"
+# Hermes
+HERMES_HOME="/root/.hermes"
+HERMES_CLI="/usr/local/bin/hermes"
+HERMES_UPDATE_TIMEOUT="1800"
+
+# Hermes external skills: off, check (default), update
+HERMES_SKILLS_MODE="check"
+HERMES_SKILLS_AUDIT="true"
+HERMES_SKILLS_SCOPE="all"
+HERMES_SKILLS_TIMEOUT="600"
 ```
 
 ## Usage
@@ -118,8 +132,12 @@ systemctl list-timers controlled-system-update
 # Run manually right now
 sudo /usr/local/bin/auto-update.sh
 
-# Trigger via systemd
+# Trigger via systemd (preferred)
 sudo systemctl start controlled-system-update.service
+
+# Inspect the run
+systemctl show controlled-system-update.service \
+    --property=ActiveState,SubState,Result,ExecMainStatus
 
 # View logs
 journalctl -u controlled-system-update -f
@@ -149,29 +167,33 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 - **Atomic locking** — `flock` prevents concurrent runs (no race conditions, auto-releases on crash)
 - **Non-interactive apt** — `DEBIAN_FRONTEND=noninteractive` + `--force-confdef --force-confold`
 - **Package holds** — `apt-mark hold` for critical packages
-- **Config preservation** — dpkg options preserve existing config files
+- **Config preservation** — dpkg options preserve existing config files (no `--force-confmiss`)
+- **Config security** — secrets are not exported to child processes; ownership and permissions validated before sourcing
 - **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
 - **Memory limit** — 1G cap on systemd service
-- **Auto-reboot** — reboots automatically when `/var/run/reboot-required` is present (default: enabled), with configurable delay and pre-reboot Telegram notification
+- **Umask=0077** — restricts file creation permissions on systemd service
+- **Deferred reboot** — reboot scheduling occurs only after all update and verification phases
 - **needrestart** — automatically restarts services after library upgrades (if installed)
 - **Log rotation** — auto-deletes log files older than 30 days (configurable)
+- **last-run.log** — symlink to most recent run's log file
 - **Health checks** — systemd failed units, Docker status, Hermes gateway, disk/memory/load
-- **Hermes-safe** — git stash/pop preserves local mods, gateway restart + dashboard rebuild
-- **Docker-safe** — pulls images, recreates via compose, prunes dangling images
+- **Hermes-safe** — uses supported `hermes update --yes` (not custom git/uv logic)
+- **External-skill-safe** — `hermes skills check` by default; never uses `--force` (locally modified skills preserved); covers all provenance-tracked GitHub, URL, tap, and hub-installed skills
+- **Docker-safe** — groups containers by Compose project, uses Compose labels, official Docker Hub images not misclassified as local
 - **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
-- **CI** — ShellCheck linting via GitHub Actions on every push
+- **CI** — ShellCheck linting via GitHub Actions on every push (pinned action)
 
 ## File Structure
 
 ```
 controlled-system-update/
-├── .github/workflows/lint.yml         # ShellCheck CI
+├── .github/workflows/lint.yml         # ShellCheck CI (pinned action)
 ├── CHANGELOG.md                       # Version history
 ├── SKILL.md                           # Full SRE procedure + auto-mode docs
 ├── README.md                          # This file
 ├── LICENSE                            # MIT
-├── install.sh                         # One-command installer
-├── e2e-test.sh                        # End-to-end test suite
+├── install.sh                         # One-command installer (preserves config)
+├── e2e-test.sh                        # End-to-end test suite (non-destructive by default)
 ├── scripts/
 │   └── auto-update.sh                 # Main automatic update script
 ├── config/
@@ -180,12 +202,6 @@ controlled-system-update/
     ├── controlled-system-update.service  # systemd service unit
     └── controlled-system-update.timer    # systemd daily timer
 ```
-
-## Why
-
-`hermes update` restarts the gateway, which kills any agent session that invoked it. Combined with a venv that has no `pip` binary (uv-managed), a gateway that never auto-respawns, and apt prompts that hang non-interactive scripts, a naive "apt upgrade && hermes update" breaks the agent in at least four distinct ways.
-
-This project encodes the working order of operations, the repair paths for each failure mode, and wraps it all in a script that runs automatically — notifying you only when something goes wrong.
 
 ## Uninstall
 
