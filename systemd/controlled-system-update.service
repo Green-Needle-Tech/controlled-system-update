@@ -1,5 +1,5 @@
 [Unit]
-Description=Controlled System Update - Automatic all-software update
+Description=Controlled System Update - Automatic OS, Docker, and Hermes update
 Documentation=https://github.com/Green-Needle-Tech/controlled-system-update
 Wants=network-online.target
 After=network-online.target docker.service
@@ -19,6 +19,8 @@ TimeoutStartSec=3600
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+# Restrict file creation permissions
+Umask=0077
 # Logging
 StandardOutput=journal
 StandardError=journal

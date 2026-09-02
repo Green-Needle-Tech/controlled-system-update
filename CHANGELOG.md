@@ -3,6 +3,46 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [2.3.0] - 2026-09-02
+
+### Added
+- Hermes hub-skill check/update/audit phase (`HERMES_SKILLS_MODE`, `HERMES_SKILLS_AUDIT`, `HERMES_SKILLS_TIMEOUT`)
+- Hermes profile and command timeouts (`HERMES_HOME`, `HERMES_USER_HOME`, `HERMES_UPDATE_TIMEOUT`)
+- Non-destructive test mode (`RUN_DESTRUCTIVE_TESTS` gate in e2e-test.sh)
+- Configuration ownership and permissions validation before sourcing
+- `AUTO_REMOVE` config option (opt-in, default: false)
+- `last-run.log` is now a proper symlink (via `ln -sfn`)
+- `Umask=0077` on systemd service unit
+- `permissions: contents: read` on CI workflow
+
+### Changed
+- Hermes updates now use the supported `hermes update --yes` workflow (replaces custom git pull/uv sync/gateway restart logic)
+- Bundled skills are synchronized by the Hermes updater (not manually)
+- Reboot scheduling occurs only after all update and verification phases (services are not stopped prematurely)
+- Existing configuration is preserved during reinstall (new template installed as `.dist`)
+- Risky global npm, uv-tool, autoremove, and reboot operations are opt-in (default: false)
+- Docker Compose projects are identified using Compose labels (not container names)
+- Docker image updates grouped by Compose project for efficient batch recreation
+- CI action pinned to version tag instead of `@master`
+- Lock error message uses `lslocks` for PID lookup instead of reading lock file content
+
+### Fixed
+- Lock tests now acquire a real `flock` (no longer write a fake PID into the lock file)
+- E2E tests preserve command exit status (no longer masked by `|| true`)
+- Tests no longer perform live updates unless explicitly authorized (`RUN_DESTRUCTIVE_TESTS=true`)
+- Official Docker Hub images (e.g. `nginx:latest`, `postgres:17`) are no longer misclassified as local
+- `--force-confmiss` removed (was restoring intentionally deleted conffiles, contrary to config-preservation policy)
+- `set -a`/`set +a` removed (Telegram secrets are no longer exported to every child process)
+- `last-run.log` is now a symlink as documented (was a regular duplicate file)
+- Removed unused `LOCK_TIMEOUT` and `HERMES_VENV` configuration variables
+- Removed unused `HERMES_DIR`, `HERMES_WEB_DIR`, `UV_BIN` (replaced by Hermes CLI path and `HERMES_USER_HOME`)
+
+### Security
+- Configuration secrets are no longer exported to every child process
+- CI actions are pinned (no longer using `@master`)
+- Hermes skill updates retain scanner enforcement and never use automatic `--force`
+- Configuration file ownership (root) and permissions (no group/other write) validated before sourcing
+
 ## [2.2.0] - 2026-09-01
 
 ### Changed

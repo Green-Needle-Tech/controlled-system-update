@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # controlled-system-update: Automatic system update script
-# Updates: OS packages, Snap, Docker images, Hermes Agent, Python/npm globals
+# Updates: OS packages, Snap, Docker images, Hermes Agent, Hermes hub skills,
+#          Python/uv tools, npm globals
 # Notifies Telegram ONLY on failure (silent on success)
 #
 # Part of: https://github.com/Green-Needle-Tech/controlled-system-update
@@ -14,12 +15,26 @@ set -uo pipefail
 
 CONFIG_FILE="${CSU_CONFIG:-/etc/controlled-system-update/auto-update.conf}"
 
-# Load config if it exists (re-export so functions and subshells can see them)
+# Load config if it exists — source directly (no set -a; secrets should not
+# be exported to every child process like apt, docker, git, npm, etc.)
 if [[ -f "$CONFIG_FILE" ]]; then
+    # Validate ownership and permissions before sourcing
+    config_uid="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || echo '0')"
+    config_mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo '600')"
+
+    if [[ "$config_uid" != "0" ]]; then
+        printf 'ERROR: %s must be owned by root\n' "$CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    if [[ -n "$config_mode" ]] && (( 8#$config_mode & 8#022 )); then
+        printf 'ERROR: %s must not be writable by group or others\n' \
+            "$CONFIG_FILE" >&2
+        exit 1
+    fi
+
     # shellcheck source=/dev/null
-    set -a
     source "$CONFIG_FILE"
-    set +a
 fi
 
 # Telegram settings (can be overridden in config or env)
@@ -28,11 +43,18 @@ TG_CHAT_ID="${TG_CHAT_ID:-}"
 HOSTNAME_LABEL="${HOSTNAME_LABEL:-$(hostname -s)}"
 
 # Paths (Hermes deployment profile)
-HERMES_DIR="${HERMES_DIR:-/usr/local/lib/hermes-agent}"
-HERMES_VENV="${HERMES_VENV:-${HERMES_DIR}/venv}"
-UV_BIN="${UV_BIN:-${HOME}/.local/bin/uv}"
+HERMES_HOME="${HERMES_HOME:-/root/.hermes}"
+HERMES_USER_HOME="${HERMES_USER_HOME:-/root}"
 HERMES_CLI="${HERMES_CLI:-/usr/local/bin/hermes}"
-HERMES_WEB_DIR="${HERMES_WEB_DIR:-${HERMES_DIR}/web}"
+HERMES_UPDATE_TIMEOUT="${HERMES_UPDATE_TIMEOUT:-1800}"
+
+# Hermes hub-skill update mode
+# off:    do nothing
+# check:  report available hub-skill updates without installing
+# update: install available hub-skill updates
+HERMES_SKILLS_MODE="${HERMES_SKILLS_MODE:-check}"
+HERMES_SKILLS_AUDIT="${HERMES_SKILLS_AUDIT:-true}"
+HERMES_SKILLS_TIMEOUT="${HERMES_SKILLS_TIMEOUT:-600}"
 
 # Logging
 LOG_DIR="${LOG_DIR:-/var/log/controlled-system-update}"
@@ -42,15 +64,17 @@ LAST_LOG="${LOG_DIR}/last-run.log"
 # Package holds (space-separated list to exclude from upgrades)
 PKG_HOLDS="${PKG_HOLDS:-}"
 
-# Whether to reboot if required (auto-reboot)
-AUTO_REBOOT="${AUTO_REBOOT:-true}"
+# Whether to reboot if required (auto-reboot) — opt-in for safety
+AUTO_REBOOT="${AUTO_REBOOT:-false}"
 
-# Delay (in minutes) before auto-reboot — gives time for notification and graceful shutdown
+# Delay (in minutes) before auto-reboot
 REBOOT_DELAY="${REBOOT_DELAY:-5}"
 
-# Whether to run dist-upgrade (can remove packages — riskier than upgrade)
-# Default: false for safety in automatic mode; set true for manual/maintenance runs
+# Whether to run dist-upgrade (can remove packages — riskier)
 DIST_UPGRADE="${DIST_UPGRADE:-false}"
+
+# Whether to run apt-get autoremove — opt-in for safety
+AUTO_REMOVE="${AUTO_REMOVE:-false}"
 
 # Log retention: delete log files older than N days (0 = disable cleanup)
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
@@ -64,11 +88,14 @@ UPDATE_HERMES="${UPDATE_HERMES:-true}"
 # Whether to update Snap packages
 UPDATE_SNAP="${UPDATE_SNAP:-true}"
 
-# Whether to update npm global packages
-UPDATE_NPM="${UPDATE_NPM:-true}"
+# Whether to update npm global packages — opt-in (not OS maintenance)
+UPDATE_NPM="${UPDATE_NPM:-false}"
 
-# Whether to update Python/uv packages
-UPDATE_PYTHON="${UPDATE_PYTHON:-true}"
+# Whether to update Python/uv tools — opt-in (not OS maintenance)
+UPDATE_PYTHON="${UPDATE_PYTHON:-false}"
+
+# Track whether a reboot is required (set during OS phase, acted on at end)
+REBOOT_REQUIRED=false
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -131,9 +158,9 @@ LOCK_FD=200
 acquire_lock() {
     eval "exec ${LOCK_FD}>\"$LOCK_FILE\""
     if ! flock -n ${LOCK_FD}; then
-        local lock_pid
-        lock_pid="$(cat "$LOCK_FILE" 2>/dev/null || echo 'unknown')"
-        log_error "Another update is already running (PID: ${lock_pid})"
+        local lock_pids
+        lock_pids="$(lslocks -o PID -n "$LOCK_FILE" 2>/dev/null | tr -d '\n' || echo 'unknown')"
+        log_error "Another update is already running (PID: ${lock_pids})"
         exit 1
     fi
     echo $$ >&${LOCK_FD}
@@ -164,7 +191,6 @@ update_os_packages() {
     if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" \
-        -o Dpkg::Options::="--force-confmiss" \
         >> "$LOG_FILE" 2>&1; then
         add_error "OS" "apt-get upgrade failed"
         log_error "apt-get upgrade failed"
@@ -176,7 +202,6 @@ update_os_packages() {
         if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold" \
-            -o Dpkg::Options::="--force-confmiss" \
             >> "$LOG_FILE" 2>&1; then
             add_error "OS" "apt-get dist-upgrade failed"
             log_error "apt-get dist-upgrade failed"
@@ -186,10 +211,14 @@ update_os_packages() {
         log_info "Skipping dist-upgrade (DIST_UPGRADE=false) — use manual mode for dist-upgrade"
     fi
 
-    log_info "Running apt-get autoremove..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >> "$LOG_FILE" 2>&1; then
-        add_warning "OS" "apt-get autoremove had issues (non-fatal)"
-        log_warn "apt-get autoremove had issues"
+    if [[ "$AUTO_REMOVE" == "true" ]]; then
+        log_info "Running apt-get autoremove (AUTO_REMOVE=true)..."
+        if ! DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >> "$LOG_FILE" 2>&1; then
+            add_warning "OS" "apt-get autoremove had issues (non-fatal)"
+            log_warn "apt-get autoremove had issues"
+        fi
+    else
+        log_info "Skipping autoremove (AUTO_REMOVE=false)"
     fi
 
     log_info "Running apt-get autoclean..."
@@ -217,35 +246,10 @@ update_os_packages() {
         log_info "needrestart not installed, skipping service restart check"
     fi
 
-    # Check if reboot is required
+    # Record whether a reboot is required — do not act on it yet
     if [[ -f /var/run/reboot-required ]]; then
+        REBOOT_REQUIRED=true
         log_warn "System reboot is required"
-        if [[ "$AUTO_REBOOT" == "true" ]]; then
-            log_info "AUTO_REBOOT=true, scheduling reboot in ${REBOOT_DELAY} minutes..."
-            add_warning "OS" "Reboot required — auto-reboot scheduled in ${REBOOT_DELAY} minutes"
-            # Send immediate Telegram notification about pending reboot
-            local reboot_msg
-            reboot_msg="<b>[${HOSTNAME_LABEL}] Reboot Scheduled</b>"
-            reboot_msg+="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-            reboot_msg+="\n<b>[OS]</b> Reboot required after system update — auto-rebooting in ${REBOOT_DELAY} minutes."
-            reboot_msg+="\nServices will restart automatically after reboot."
-            notify_telegram "$reboot_msg"
-            # Gracefully stop services before reboot
-            log_info "Gracefully stopping Docker containers before reboot..."
-            if command -v docker &>/dev/null; then
-                docker stop "$(docker ps -q 2>/dev/null)" 2>/dev/null >> "$LOG_FILE" 2>&1 || true
-            fi
-            log_info "Gracefully stopping Hermes gateway before reboot..."
-            local gw_pid
-            gw_pid="$(pgrep -f 'hermes.*gateway run' 2>/dev/null || true)"
-            if [[ -n "$gw_pid" ]]; then
-                kill -TERM "$gw_pid" 2>/dev/null || true
-                sleep 2
-            fi
-            shutdown -r "+${REBOOT_DELAY}" "Automatic reboot after system update" 2>/dev/null || true
-        else
-            add_warning "OS" "Reboot required but AUTO_REBOOT=false - manual reboot needed"
-        fi
     fi
 
     log_info "OS package update complete"
@@ -292,54 +296,43 @@ update_docker_images() {
     local updated=0
     local failed=0
 
+    # Group containers by Compose project for efficient batch recreation
+    local compose_projects=""
+
     while IFS='|' read -r name image; do
-        # Skip images that are locally built (image IDs, local names without registry prefix)
-        # Image IDs are 12-char hex strings; local images don't contain '/' or '.'
+        # Skip images that are locally built (image IDs are 12-char hex strings)
         if [[ "$image" =~ ^[a-f0-9]{12}$ ]]; then
             log_info "Skipping locally-built image (ID): $image (container: $name)"
             continue
         fi
-        # Skip if image name has no '/' (not a registry reference)
-        # e.g. "llm-smart-router:1.0" or "david-digital-hub-app" are local images
-        # Strip tag suffix to check the repository part only
-        local repo_part="${image%%:*}"
-        if [[ "$repo_part" != *"/"* ]]; then
-            log_info "Skipping local image (no registry): $image (container: $name)"
+
+        # Check if this container is part of a Compose project
+        local compose_project
+        compose_project="$(
+            docker inspect \
+                --format '{{ index .Config.Labels "com.docker.compose.project" }}' \
+                "$name" 2>/dev/null || true
+        )"
+
+        if [[ -n "$compose_project" ]]; then
+            # Track unique compose projects
+            if ! echo "$compose_projects" | grep -qF "|${compose_project}|"; then
+                compose_projects="${compose_projects}|${compose_project}|"
+            fi
             continue
         fi
+
+        # Standalone container — pull and check for updates
+        # Do NOT classify images without '/' as local; official Docker Hub images
+        # like nginx:latest, postgres:17, redis:alpine are valid registry images.
         log_info "Pulling image: $image (container: $name)"
         if docker pull "$image" >> "$LOG_FILE" 2>&1; then
-            # Check if the pulled image is different from the running one
             local new_id old_id
             new_id="$(docker inspect --format '{{.Id}}' "$image" 2>/dev/null || echo "")"
             old_id="$(docker inspect --format '{{.Image}}' "$name" 2>/dev/null || echo "")"
             if [[ -n "$new_id" && -n "$old_id" && "$new_id" != "$old_id" ]]; then
-                log_info "Image updated for $name, recreating container..."
-                # Try to recreate using docker compose if a compose file exists
-                local compose_dir=""
-                compose_dir="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2>/dev/null || echo "")"
-                if [[ -n "$compose_dir" ]]; then
-                    local compose_file=""
-                    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
-                        if [[ -f "${compose_dir}/${f}" ]]; then
-                            compose_file="${compose_dir}/${f}"
-                            break
-                        fi
-                    done
-                    if [[ -n "$compose_file" ]]; then
-                        log_info "Using docker compose at $compose_file"
-                        if ! (cd "$compose_dir" && docker compose -f "$compose_file" up -d --force-recreate "$name" >> "$LOG_FILE" 2>&1); then
-                            add_error "Docker" "Failed to recreate container $name via compose"
-                            failed=$((failed + 1))
-                        else
-                            updated=$((updated + 1))
-                        fi
-                    else
-                        # No compose file found — just note that a restart is needed
-                        add_warning "Docker" "Image updated for $name but no compose file found - manual recreate needed"
-                        log_warn "No compose file for $name, manual recreate needed"
-                    fi
-                fi
+                log_info "Image updated for $name, manual recreate needed"
+                add_warning "Docker" "Image updated for standalone container $name — manual recreate needed"
             fi
         else
             add_error "Docker" "Failed to pull image $image for container $name"
@@ -348,124 +341,161 @@ update_docker_images() {
         fi
     done <<< "$containers"
 
+    # Process Compose projects as a group
+    for project in $(echo "$compose_projects" | tr '|' '\n' | grep -v '^$'); do
+        local compose_files
+        compose_files="$(
+            docker inspect \
+                --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' \
+                "$(docker ps --filter "label=com.docker.compose.project=$project" -q 2>/dev/null | head -1)" \
+                2>/dev/null || true
+        )"
+        local compose_dir
+        compose_dir="$(
+            docker inspect \
+                --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' \
+                "$(docker ps --filter "label=com.docker.compose.project=$project" -q 2>/dev/null | head -1)" \
+                2>/dev/null || true
+        )"
+
+        if [[ -n "$compose_dir" && -n "$compose_files" ]]; then
+            log_info "Updating Compose project: $project (dir: $compose_dir)"
+            if (cd "$compose_dir" && docker compose pull >> "$LOG_FILE" 2>&1 && \
+                docker compose up -d --force-recreate >> "$LOG_FILE" 2>&1); then
+                updated=$((updated + 1))
+                log_info "Compose project $project updated"
+            else
+                add_error "Docker" "Failed to update Compose project $project"
+                failed=$((failed + 1))
+            fi
+        elif [[ -n "$compose_dir" ]]; then
+            # Fallback: find compose file manually
+            local compose_file=""
+            for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+                if [[ -f "${compose_dir}/${f}" ]]; then
+                    compose_file="${compose_dir}/${f}"
+                    break
+                fi
+            done
+            if [[ -n "$compose_file" ]]; then
+                log_info "Updating Compose project: $project (file: $compose_file)"
+                if (cd "$compose_dir" && docker compose -f "$compose_file" pull >> "$LOG_FILE" 2>&1 && \
+                    docker compose -f "$compose_file" up -d --force-recreate >> "$LOG_FILE" 2>&1); then
+                    updated=$((updated + 1))
+                    log_info "Compose project $project updated"
+                else
+                    add_error "Docker" "Failed to update Compose project $project"
+                    failed=$((failed + 1))
+                fi
+            else
+                add_warning "Docker" "Compose project $project: no compose file found"
+            fi
+        fi
+    done
+
     # Prune dangling images
     log_info "Pruning dangling images..."
     docker image prune -f >> "$LOG_FILE" 2>&1 || true
 
-    log_info "Docker update complete: $updated updated, $failed failed"
+    log_info "Docker update complete: $updated projects updated, $failed failed"
+}
+
+run_hermes() {
+    env \
+        HOME="$HERMES_USER_HOME" \
+        HERMES_HOME="$HERMES_HOME" \
+        "$HERMES_CLI" "$@"
 }
 
 update_hermes_agent() {
     log_info "=== Hermes Agent Update ==="
-    if [[ ! -d "$HERMES_DIR/.git" ]]; then
-        log_info "Hermes not installed as git clone at $HERMES_DIR, skipping"
-        return 0
-    fi
+
     if [[ "$UPDATE_HERMES" != "true" ]]; then
         log_info "Hermes updates disabled, skipping"
         return 0
     fi
 
-    cd "$HERMES_DIR" || return 1
-
-    # Record current commit
-    local old_commit
-    old_commit="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-    log_info "Current Hermes commit: $old_commit"
-
-    # Stash local changes
-    local stash_needed=false
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-        stash_needed=true
-        log_info "Stashing local changes..."
-        if ! git stash push -m "auto-update-$(date +%Y%m%d-%H%M%S)" >> "$LOG_FILE" 2>&1; then
-            add_error "Hermes" "Failed to git stash local changes"
-            log_error "git stash failed"
-            return 1
-        fi
-    fi
-
-    # Pull upstream
-    log_info "Pulling upstream changes..."
-    if ! git pull origin main >> "$LOG_FILE" 2>&1; then
-        add_error "Hermes" "git pull origin main failed"
-        log_error "git pull failed"
-        # Try to restore stashed changes
-        if $stash_needed; then
-            git stash pop >> "$LOG_FILE" 2>&1 || true
-        fi
-        return 1
-    fi
-
-    # Restore local changes
-    if $stash_needed; then
-        log_info "Restoring stashed changes..."
-        if ! git stash pop >> "$LOG_FILE" 2>&1; then
-            add_warning "Hermes" "git stash pop conflict - manual resolution needed"
-            log_warn "git stash pop conflict"
-        fi
-    fi
-
-    local new_commit
-    new_commit="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-    log_info "New Hermes commit: $new_commit"
-
-    if [[ "$old_commit" == "$new_commit" ]]; then
-        log_info "Hermes already up to date"
+    if [[ ! -x "$HERMES_CLI" ]]; then
+        add_warning "Hermes" "Hermes CLI not executable at $HERMES_CLI"
         return 0
     fi
 
-    log_info "Hermes updated: $old_commit -> $new_commit"
+    local old_version new_version
+    old_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
+    log_info "Current Hermes version: $old_version"
 
-    # Rebuild venv if pyproject/lockfile changed
-    if [[ -f "${HERMES_DIR}/pyproject.toml" ]]; then
-        log_info "Rebuilding venv with uv..."
-        if [[ -x "$UV_BIN" ]]; then
-            if ! "$UV_BIN" sync >> "$LOG_FILE" 2>&1; then
-                add_warning "Hermes" "uv sync had issues (non-fatal)"
-                log_warn "uv sync had issues"
-            fi
-            if ! "$UV_BIN" pip install -e . >> "$LOG_FILE" 2>&1; then
-                add_warning "Hermes" "uv pip install -e . had issues (non-fatal)"
-                log_warn "uv pip install had issues"
-            fi
-        else
-            add_warning "Hermes" "uv not found at $UV_BIN - venv not rebuilt"
-        fi
+    log_info "Running supported Hermes updater..."
+    if ! timeout \
+        --signal=TERM \
+        --kill-after=30s \
+        "$HERMES_UPDATE_TIMEOUT" \
+        env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+        "$HERMES_CLI" update --yes >>"$LOG_FILE" 2>&1; then
+        add_error "Hermes" "hermes update failed or timed out"
+        log_error "Hermes update failed"
+        return 1
     fi
 
-    # Restart gateway
-    log_info "Restarting Hermes gateway..."
-    local gateway_pid
-    gateway_pid="$(pgrep -f 'hermes.*gateway run' 2>/dev/null || true)"
-    if [[ -n "$gateway_pid" ]]; then
-        kill -TERM "$gateway_pid" 2>/dev/null || true
-        sleep 3
+    new_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
+    log_info "Hermes version after update: $new_version"
+
+    if ! run_hermes doctor >>"$LOG_FILE" 2>&1; then
+        add_warning "Hermes" "hermes doctor reported problems after update"
+    fi
+}
+
+update_hermes_skills() {
+    log_info "=== Hermes Skills Update ==="
+
+    if [[ ! -x "$HERMES_CLI" ]]; then
+        log_info "Hermes CLI not available, skipping skill updates"
+        return 0
     fi
 
-    if [[ -x "$HERMES_CLI" ]]; then
-        nohup "$HERMES_CLI" gateway run --replace >> "${HOME}/.hermes/logs/gateway-stdout.log" 2>&1 &
-        sleep 5
-        if pgrep -f 'hermes.*gateway run' >/dev/null 2>&1; then
-            log_info "Gateway restarted successfully"
-        else
-            add_error "Hermes" "Gateway failed to restart after update"
-            log_error "Gateway DOWN after restart"
-        fi
-    fi
-
-    # Rebuild dashboard
-    if [[ -d "$HERMES_WEB_DIR" ]]; then
-        log_info "Rebuilding Hermes dashboard..."
-        if (cd "$HERMES_WEB_DIR" && npm run build >> "$LOG_FILE" 2>&1); then
-            if systemctl restart hermes-dashboard 2>/dev/null; then
-                log_info "Dashboard rebuilt and restarted"
-            else
-                add_warning "Hermes" "Dashboard rebuilt but systemctl restart failed"
+    case "$HERMES_SKILLS_MODE" in
+        off)
+            log_info "Hermes hub-skill updates disabled"
+            return 0
+            ;;
+        check)
+            log_info "Checking installed hub skills for updates..."
+            if ! timeout \
+                --signal=TERM \
+                --kill-after=30s \
+                "$HERMES_SKILLS_TIMEOUT" \
+                env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+                "$HERMES_CLI" skills check >>"$LOG_FILE" 2>&1; then
+                add_warning "Hermes Skills" "Skill update check failed"
             fi
-        else
-            add_warning "Hermes" "Dashboard npm run build failed"
-            log_warn "Dashboard build failed"
+            ;;
+        update)
+            log_info "Updating installed Hermes hub skills..."
+            if ! timeout \
+                --signal=TERM \
+                --kill-after=30s \
+                "$HERMES_SKILLS_TIMEOUT" \
+                env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+                "$HERMES_CLI" skills update >>"$LOG_FILE" 2>&1; then
+                add_warning "Hermes Skills" "One or more skills could not be updated"
+            fi
+            ;;
+        *)
+            add_error \
+                "Configuration" \
+                "Invalid HERMES_SKILLS_MODE: $HERMES_SKILLS_MODE"
+            return 1
+            ;;
+    esac
+
+    if [[ "$HERMES_SKILLS_AUDIT" == "true" ]]; then
+        log_info "Auditing installed Hermes hub skills..."
+        if ! timeout \
+            --signal=TERM \
+            --kill-after=30s \
+            "$HERMES_SKILLS_TIMEOUT" \
+            env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
+            "$HERMES_CLI" skills audit >>"$LOG_FILE" 2>&1; then
+            add_warning "Hermes Skills" "Skill security audit reported an error"
         fi
     fi
 }
@@ -476,16 +506,17 @@ update_python_packages() {
         log_info "Python updates disabled, skipping"
         return 0
     fi
-    if [[ ! -x "$UV_BIN" ]]; then
+    local uv_bin="${UV_BIN:-${HERMES_USER_HOME}/.local/bin/uv}"
+    if [[ ! -x "$uv_bin" ]]; then
         log_info "uv not found, skipping Python package updates"
         return 0
     fi
 
     # Update uv-managed tools if any
     log_info "Updating uv-installed tools..."
-    if "$UV_BIN" tool list --format json 2>/dev/null | grep -q '"name"'; then
+    if "$uv_bin" tool list --format json 2>/dev/null | grep -q '"name"'; then
         local tools
-        tools="$("$UV_BIN" tool list --format json 2>/dev/null | python3 -c "
+        tools="$("$uv_bin" tool list --format json 2>/dev/null | python3 -c "
 import sys, json
 try:
     for t in json.load(sys.stdin):
@@ -496,8 +527,8 @@ except Exception:
         if [[ -n "$tools" ]]; then
             for tool in $tools; do
                 log_info "Updating tool: $tool"
-                "$UV_BIN" tool upgrade "$tool" >> "$LOG_FILE" 2>&1 || \
-                    "$UV_BIN" tool install "$tool" >> "$LOG_FILE" 2>&1 || true
+                "$uv_bin" tool upgrade "$tool" >> "$LOG_FILE" 2>&1 || \
+                    "$uv_bin" tool install "$tool" >> "$LOG_FILE" 2>&1 || true
             done
         fi
     fi
@@ -596,6 +627,30 @@ run_health_checks() {
     return $failures
 }
 
+# ─── Reboot scheduling (deferred to end of run) ──────────────────────────────
+
+schedule_reboot_if_required() {
+    if [[ "$REBOOT_REQUIRED" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ "$AUTO_REBOOT" != "true" ]]; then
+        add_warning "OS" "Reboot required; AUTO_REBOOT is disabled"
+        return 0
+    fi
+
+    notify_telegram \
+        "[${HOSTNAME_LABEL}] Reboot required; scheduled in ${REBOOT_DELAY} minutes."
+
+    if ! shutdown -r "+${REBOOT_DELAY}" \
+        "Automatic reboot after controlled system update"; then
+        add_error "OS" "Failed to schedule reboot"
+        return 1
+    fi
+
+    log_info "Reboot scheduled in ${REBOOT_DELAY} minutes"
+}
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 main() {
@@ -603,7 +658,6 @@ main() {
     mkdir -p "$LOG_DIR"
     # Start fresh log file
     : > "$LOG_FILE"
-    : > "$LAST_LOG"
 
     # Log rotation: delete old log files
     if [[ "${LOG_RETENTION_DAYS:-0}" -gt 0 ]]; then
@@ -611,8 +665,9 @@ main() {
         log_info "Cleaned up log files older than ${LOG_RETENTION_DAYS} days"
     fi
 
-    # Redirect all output to both LOG_FILE and LAST_LOG via tee
-    exec > >(tee -a "$LOG_FILE" "$LAST_LOG") 2>&1
+    # Redirect all output to LOG_FILE (and create last-run.log as a symlink)
+    ln -sfn "$(basename "$LOG_FILE")" "$LAST_LOG"
+    exec > >(tee -a "$LOG_FILE") 2>&1
 
     log_info "========================================"
     log_info "Controlled System Update - $(date)"
@@ -626,6 +681,7 @@ main() {
     update_snap_packages
     update_docker_images
     update_hermes_agent
+    update_hermes_skills
     update_python_packages
     update_npm_packages
 
@@ -648,6 +704,9 @@ main() {
         has_warnings=true
     fi
 
+    # Schedule reboot only after all updates and health checks are done
+    schedule_reboot_if_required
+
     if $has_errors; then
         local message
         message="<b>[$HOSTNAME_LABEL] System Update FAILED</b>"
@@ -663,7 +722,7 @@ main() {
         notify_telegram "$message"
         exit 1
     elif $has_warnings; then
-        # Warnings only — still notify so David is aware
+        # Warnings only — still notify so user is aware
         local message
         message="<b>[$HOSTNAME_LABEL] System Update Completed with Warnings</b>"
         message+="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
