@@ -80,8 +80,9 @@ Key settings:
 - `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
 - `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_CLI` — paths for non-standard installations
 - `HERMES_UPDATE_TIMEOUT` — timeout for `hermes update` in seconds (default: 1800)
-- `HERMES_SKILLS_MODE` — hub-skill update mode: `off`, `check` (default), `update`
-- `HERMES_SKILLS_AUDIT` — re-scan installed hub skills after check/update (default: true)
+- `HERMES_SKILLS_MODE` — external skill update mode: `off`, `check` (default), `update`
+- `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
+- `HERMES_SKILLS_SCOPE` — include all Hermes-managed sources: GitHub, URL, tap, hub, community (default: all)
 - `HERMES_SKILLS_TIMEOUT` — timeout for skill operations in seconds (default: 600)
 
 ### Manual operations
@@ -243,25 +244,80 @@ free -h; df -h /
 
 Final: run a test Hermes invocation (simple prompt via CLI or a Telegram ping) to prove tool calling, API connections, and core loop execution.
 
-## Hermes Skill Updates
+## Updating Hermes Skills
 
-There are two separate skill classes:
+Hermes skills have separate update lifecycles.
 
-- **Bundled skills:** synchronized during `hermes update`.
-- **Hub/URL-installed skills:** updated using `hermes skills check`, `hermes skills update`, and `hermes skills audit`.
+### Bundled skills
+
+Bundled skills are synchronized by the Hermes core updater:
 
 ```bash
-# Bundled skills are synchronized by the Hermes core updater.
 hermes update --check
 hermes update --yes
+```
 
-# Hub and direct-URL skills have a separate lifecycle.
+Locally modified bundled skills are preserved.
+
+### Unofficial GitHub and other external skills
+
+Skills installed through the Hermes Skills Hub retain their source provenance.
+This includes unofficial GitHub repositories, custom GitHub taps, direct URLs,
+skills.sh, well-known endpoints, and community registries — anything installed
+via `hermes skills install` and tracked in `${HERMES_HOME}/skills/.hub/lock.json`.
+
+List and inspect tracked skills:
+
+```bash
+hermes skills list --source hub
 hermes skills check
+```
+
+Update all changed, provenance-tracked skills:
+
+```bash
 hermes skills update
 hermes skills audit
 ```
 
-For this repository's own skill, install it with tracked provenance rather than copying it manually:
+Update one specific GitHub-installed skill:
+
+```bash
+hermes skills update some-skill
+```
+
+Never use `--force` during unattended maintenance. Hermes normally skips a
+skill when its installed files have been edited locally. Forced updates may
+discard those edits.
+
+A skill copied or cloned manually into `~/.hermes/skills/` is not managed by
+the hub updater. Back it up and reinstall it once using its GitHub identifier:
+
+```bash
+hermes skills inspect owner/repository/skills/skill-name
+hermes skills install owner/repository/skills/skill-name
+```
+
+All community skills must pass Hermes security scanning before installation.
+A successful update does not imply that the upstream project is trustworthy;
+review source changes and audit results before enabling automatic updates.
+
+### Optional required-skill inventory
+
+Create `/etc/controlled-system-update/hermes-skills.conf` to declare required
+GitHub skills. The update script reports missing skills as warnings — it does
+not silently install new third-party code during a system update.
+
+```bash
+HERMES_REQUIRED_GITHUB_SKILLS=(
+    "Green-Needle-Tech/controlled-system-update"
+    "some-owner/some-repository/skills/some-skill"
+)
+```
+
+### Installing this project's own skill
+
+Install it with tracked provenance rather than copying it manually:
 
 ```bash
 hermes skills install \
@@ -276,7 +332,9 @@ Subsequent releases can then be applied through:
 hermes skills update controlled-system-update
 ```
 
-If the existing local skill was manually copied and therefore has no hub provenance, perform one reviewed migration with `hermes skills install`; do not automatically force replacement of local edits.
+If the existing local skill was manually copied and therefore has no hub
+provenance, perform one reviewed migration with `hermes skills install`; do
+not automatically force replacement of local edits.
 
 ## Repair Playbook (non-destructive)
 

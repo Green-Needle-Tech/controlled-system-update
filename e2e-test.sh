@@ -171,6 +171,12 @@ else
     warn "HERMES_SKILLS_MODE = ${HERMES_SKILLS_MODE:-} (expected check as conservative default)"
 fi
 
+if [[ "${HERMES_SKILLS_SCOPE:-}" == "all" ]]; then
+    pass "HERMES_SKILLS_SCOPE = all (all managed sources)"
+else
+    warn "HERMES_SKILLS_SCOPE = ${HERMES_SKILLS_SCOPE:-} (expected all)"
+fi
+
 # ─── 4. systemd Timer Status ─────────────────────────────────────────────────
 
 echo ""

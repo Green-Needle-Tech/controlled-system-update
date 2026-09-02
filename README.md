@@ -2,7 +2,7 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v2.3.0** — Production hardening: supported Hermes updater, hub-skill lifecycle, deferred reboot, config preservation, safer defaults, real flock tests.
+**v2.3.0** — Production hardening: supported Hermes updater, external skill lifecycle, deferred reboot, config preservation, safer defaults, real flock tests.
 
 ## What It Updates
 
@@ -14,7 +14,7 @@ The automatic mode updates the following by default:
 | Snap packages | snap refresh | enabled |
 | Docker images | Pull latest for running containers, recreate via Compose if changed | enabled |
 | Hermes Agent | `hermes update --yes` (supported updater) | enabled |
-| Hermes hub skills | `hermes skills check` (report only) | enabled |
+| Hermes external skills | `hermes skills check` (report only) | enabled |
 | Python/uv tools | uv tool upgrade | **opt-in** |
 | npm global packages | npm update -g | **opt-in** |
 | dist-upgrade | apt-get dist-upgrade | **opt-in** |
@@ -111,9 +111,10 @@ HERMES_HOME="/root/.hermes"
 HERMES_CLI="/usr/local/bin/hermes"
 HERMES_UPDATE_TIMEOUT="1800"
 
-# Hermes hub skills: off, check (default), update
+# Hermes external skills: off, check (default), update
 HERMES_SKILLS_MODE="check"
 HERMES_SKILLS_AUDIT="true"
+HERMES_SKILLS_SCOPE="all"
 HERMES_SKILLS_TIMEOUT="600"
 ```
 
@@ -177,7 +178,7 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 - **last-run.log** — symlink to most recent run's log file
 - **Health checks** — systemd failed units, Docker status, Hermes gateway, disk/memory/load
 - **Hermes-safe** — uses supported `hermes update --yes` (not custom git/uv logic)
-- **Hub-skill-safe** — `hermes skills check` by default; never uses `--force` (locally modified skills preserved)
+- **External-skill-safe** — `hermes skills check` by default; never uses `--force` (locally modified skills preserved); covers all provenance-tracked GitHub, URL, tap, and hub-installed skills
 - **Docker-safe** — groups containers by Compose project, uses Compose labels, official Docker Hub images not misclassified as local
 - **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
 - **CI** — ShellCheck linting via GitHub Actions on every push (pinned action)

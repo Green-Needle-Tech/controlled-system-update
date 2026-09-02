@@ -6,7 +6,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 ## [2.3.0] - 2026-09-02
 
 ### Added
-- Hermes hub-skill check/update/audit phase (`HERMES_SKILLS_MODE`, `HERMES_SKILLS_AUDIT`, `HERMES_SKILLS_TIMEOUT`)
+- Hermes external skill check/update/audit phase (`HERMES_SKILLS_MODE`, `HERMES_SKILLS_AUDIT`, `HERMES_SKILLS_SCOPE`, `HERMES_SKILLS_TIMEOUT`)
+- Optional required-skill inventory verification (`hermes-skills.conf`, `HERMES_REQUIRED_GITHUB_SKILLS`)
+- `run_hermes_with_timeout` helper for consistent skill command execution
 - Hermes profile and command timeouts (`HERMES_HOME`, `HERMES_USER_HOME`, `HERMES_UPDATE_TIMEOUT`)
 - Non-destructive test mode (`RUN_DESTRUCTIVE_TESTS` gate in e2e-test.sh)
 - Configuration ownership and permissions validation before sourcing
@@ -40,6 +42,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 ### Security
 - Configuration secrets are no longer exported to every child process
 - CI actions are pinned (no longer using `@master`)
+- Hermes skill updates now cover all provenance-tracked external skills (GitHub, URL, tap, hub, community), not just hub-installed
 - Hermes skill updates retain scanner enforcement and never use automatic `--force`
 - Configuration file ownership (root) and permissions (no group/other write) validated before sourcing
 

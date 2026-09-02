@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # controlled-system-update: Automatic system update script
-# Updates: OS packages, Snap, Docker images, Hermes Agent, Hermes hub skills,
-#          Python/uv tools, npm globals
+# Updates: OS packages, Snap, Docker images, Hermes Agent, Hermes external
+#          skills, Python/uv tools, npm globals
 # Notifies Telegram ONLY on failure (silent on success)
 #
 # Part of: https://github.com/Green-Needle-Tech/controlled-system-update
@@ -48,13 +48,25 @@ HERMES_USER_HOME="${HERMES_USER_HOME:-/root}"
 HERMES_CLI="${HERMES_CLI:-/usr/local/bin/hermes}"
 HERMES_UPDATE_TIMEOUT="${HERMES_UPDATE_TIMEOUT:-1800}"
 
-# Hermes hub-skill update mode
+# Hermes external skill update mode
 # off:    do nothing
-# check:  report available hub-skill updates without installing
-# update: install available hub-skill updates
+# check:  report available external skill updates without installing
+# update: update all provenance-tracked external skills
 HERMES_SKILLS_MODE="${HERMES_SKILLS_MODE:-check}"
 HERMES_SKILLS_AUDIT="${HERMES_SKILLS_AUDIT:-true}"
+HERMES_SKILLS_SCOPE="${HERMES_SKILLS_SCOPE:-all}"
 HERMES_SKILLS_TIMEOUT="${HERMES_SKILLS_TIMEOUT:-600}"
+
+# Optional inventory of required GitHub skills (for verification only)
+# Populated from /etc/controlled-system-update/hermes-skills.conf if present
+HERMES_REQUIRED_GITHUB_SKILLS=()
+
+# Load optional skill inventory file if present
+SKILLS_INVENTORY_FILE="${SKILLS_INVENTORY_FILE:-/etc/controlled-system-update/hermes-skills.conf}"
+if [[ -f "$SKILLS_INVENTORY_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$SKILLS_INVENTORY_FILE"
+fi
 
 # Logging
 LOG_DIR="${LOG_DIR:-/var/log/controlled-system-update}"
@@ -407,6 +419,17 @@ run_hermes() {
         "$HERMES_CLI" "$@"
 }
 
+run_hermes_with_timeout() {
+    timeout \
+        --signal=TERM \
+        --kill-after=30s \
+        "$HERMES_SKILLS_TIMEOUT" \
+        env \
+        HOME="$HERMES_USER_HOME" \
+        HERMES_HOME="$HERMES_HOME" \
+        "$HERMES_CLI" "$@"
+}
+
 update_hermes_agent() {
     log_info "=== Hermes Agent Update ==="
 
@@ -445,40 +468,55 @@ update_hermes_agent() {
 }
 
 update_hermes_skills() {
-    log_info "=== Hermes Skills Update ==="
+    log_info "=== Hermes External Skills Update ==="
 
     if [[ ! -x "$HERMES_CLI" ]]; then
-        log_info "Hermes CLI not available, skipping skill updates"
+        add_warning \
+            "Hermes Skills" \
+            "Hermes CLI is not executable at $HERMES_CLI"
         return 0
     fi
 
     case "$HERMES_SKILLS_MODE" in
         off)
-            log_info "Hermes hub-skill updates disabled"
+            log_info "External Hermes skill checks are disabled"
             return 0
             ;;
+
         check)
-            log_info "Checking installed hub skills for updates..."
-            if ! timeout \
-                --signal=TERM \
-                --kill-after=30s \
-                "$HERMES_SKILLS_TIMEOUT" \
-                env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
-                "$HERMES_CLI" skills check >>"$LOG_FILE" 2>&1; then
-                add_warning "Hermes Skills" "Skill update check failed"
+            log_info \
+                "Checking all tracked unofficial and hub-installed skills"
+
+            if ! run_hermes_with_timeout \
+                skills check >>"$LOG_FILE" 2>&1; then
+                add_warning \
+                    "Hermes Skills" \
+                    "Unable to check one or more external skills"
             fi
             ;;
+
         update)
-            log_info "Updating installed Hermes hub skills..."
-            if ! timeout \
-                --signal=TERM \
-                --kill-after=30s \
-                "$HERMES_SKILLS_TIMEOUT" \
-                env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
-                "$HERMES_CLI" skills update >>"$LOG_FILE" 2>&1; then
-                add_warning "Hermes Skills" "One or more skills could not be updated"
+            log_info \
+                "Checking all tracked unofficial and hub-installed skills"
+
+            if ! run_hermes_with_timeout \
+                skills check >>"$LOG_FILE" 2>&1; then
+                add_warning \
+                    "Hermes Skills" \
+                    "External skill update check reported an error"
+            fi
+
+            log_info \
+                "Updating changed GitHub, URL, tap, and hub-installed skills"
+
+            if ! run_hermes_with_timeout \
+                skills update >>"$LOG_FILE" 2>&1; then
+                add_warning \
+                    "Hermes Skills" \
+                    "One or more external skills could not be updated"
             fi
             ;;
+
         *)
             add_error \
                 "Configuration" \
@@ -488,16 +526,47 @@ update_hermes_skills() {
     esac
 
     if [[ "$HERMES_SKILLS_AUDIT" == "true" ]]; then
-        log_info "Auditing installed Hermes hub skills..."
-        if ! timeout \
-            --signal=TERM \
-            --kill-after=30s \
-            "$HERMES_SKILLS_TIMEOUT" \
-            env HOME="$HERMES_USER_HOME" HERMES_HOME="$HERMES_HOME" \
-            "$HERMES_CLI" skills audit >>"$LOG_FILE" 2>&1; then
-            add_warning "Hermes Skills" "Skill security audit reported an error"
+        log_info "Auditing all Hermes-managed external skills"
+
+        if ! run_hermes_with_timeout \
+            skills audit >>"$LOG_FILE" 2>&1; then
+            add_warning \
+                "Hermes Skills" \
+                "External skill security audit reported an error"
         fi
     fi
+}
+
+verify_required_hermes_skills() {
+    if [[ ${#HERMES_REQUIRED_GITHUB_SKILLS[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    log_info "Verifying required Hermes skill inventory..."
+
+    local inventory
+    local identifier
+    local missing=0
+
+    if ! inventory="$(
+        run_hermes skills list --source hub 2>>"$LOG_FILE"
+    )"; then
+        add_warning \
+            "Hermes Skills" \
+            "Unable to read the installed skill inventory"
+        return 0
+    fi
+
+    for identifier in "${HERMES_REQUIRED_GITHUB_SKILLS[@]}"; do
+        if ! grep -Fq -- "$identifier" <<<"$inventory"; then
+            add_warning \
+                "Hermes Skills" \
+                "Required GitHub skill is not provenance-tracked: $identifier"
+            missing=1
+        fi
+    done
+
+    return "$missing"
 }
 
 update_python_packages() {
@@ -682,6 +751,7 @@ main() {
     update_docker_images
     update_hermes_agent
     update_hermes_skills
+    verify_required_hermes_skills || true
     update_python_packages
     update_npm_packages
 
