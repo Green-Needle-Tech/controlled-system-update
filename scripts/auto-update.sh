@@ -217,6 +217,25 @@ UPDATE_PYTHON="${UPDATE_PYTHON:-false}"
 # Track whether a reboot is required (set during OS phase, acted on at end)
 REBOOT_REQUIRED=false
 
+# ─── Full Diagnostic + LLM Auto-Remediation ──────────────────────────────────
+
+# Run a comprehensive post-update diagnostic (beyond basic health checks)
+DIAGNOSTIC_ENABLED="${DIAGNOSTIC_ENABLED:-true}"
+
+# LLM-based auto-remediation: when the diagnostic finds issues, send the
+# report to an LLM which suggests remediation commands. Commands are
+# safety-checked (blocklist) before execution. The cycle repeats up to
+# LLM_MAX_REMEDIATION_ATTEMPTS times, re-running the diagnostic each round.
+LLM_REMEDIATION_ENABLED="${LLM_REMEDIATION_ENABLED:-true}"
+LLM_API_URL="${LLM_API_URL:-https://openrouter.ai/api/v1/chat/completions}"
+LLM_MODEL="${LLM_MODEL:-z-ai/glm-5.2}"
+LLM_API_KEY="${LLM_API_KEY:-}"
+LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
+LLM_MAX_REMEDIATION_ATTEMPTS="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
+
+# Diagnostic report file (written by run_full_diagnostic, read by llm_remediate)
+DIAGNOSTIC_REPORT="${LOG_DIR}/diagnostic-report.txt"
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 log() {
@@ -816,6 +835,538 @@ run_health_checks() {
     return $failures
 }
 
+# ─── Full Diagnostic ────────────────────────────────────────────────────────
+
+# Comprehensive post-update diagnostic. Goes beyond the basic health checks
+# (systemd, Docker, Hermes gateway, disk/memory/load) to also cover:
+#   - dpkg package integrity (dpkg --audit)
+#   - Broken dependencies (apt-get check)
+#   - systemd journal errors in the last 30 minutes
+#   - Network reachability (default gateway + DNS resolution)
+#   - Listening ports summary (unexpected services)
+#   - Docker container health for all containers
+#   - Hermes doctor (if available)
+#   - Filesystem errors (dmesg)
+#
+# Writes a structured report to $DIAGNOSTIC_REPORT and returns 0 if clean,
+# 1 if issues found.
+run_full_diagnostic() {
+    log_info "=== Full Post-Update Diagnostic ==="
+
+    local report="$DIAGNOSTIC_REPORT"
+    local issues=0
+    : > "$report"
+
+    {
+        echo "=== Controlled System Update — Full Diagnostic ==="
+        echo "Host: $HOSTNAME_LABEL"
+        echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo ""
+    } >> "$report"
+
+    # 1. dpkg audit — checks for half-installed/broken packages
+    local dpkg_audit
+    dpkg_audit="$(dpkg --audit 2>&1 || true)"
+    if [[ -n "$dpkg_audit" ]]; then
+        echo "--- dpkg Audit (ISSUES) ---" >> "$report"
+        echo "$dpkg_audit" >> "$report"
+        echo "" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "dpkg audit found issues"
+        log_warn "dpkg audit found issues"
+    else
+        echo "--- dpkg Audit: OK ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 2. Broken dependencies
+    local apt_check
+    apt_check="$(apt-get check 2>&1 || true)"
+    if echo "$apt_check" | grep -qiE 'broken|error|problem'; then
+        echo "--- apt-get check (ISSUES) ---" >> "$report"
+        echo "$apt_check" >> "$report"
+        echo "" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "apt-get check found broken dependencies"
+        log_warn "apt-get check found broken dependencies"
+    else
+        echo "--- apt-get check: OK ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 3. systemd failed units (detailed)
+    local failed_units
+    failed_units="$(systemctl --failed --no-legend 2>/dev/null || true)"
+    if [[ -n "$failed_units" ]]; then
+        echo "--- Failed systemd Units ---" >> "$report"
+        echo "$failed_units" >> "$report"
+        echo "" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "Failed systemd units detected"
+    else
+        echo "--- systemd Failed Units: None ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 4. systemd journal errors in last 30 min
+    local journal_errors
+    journal_errors="$(journalctl --since '30 min ago' --no-pager \
+        -p err 2>/dev/null | tail -50 || true)"
+    if [[ -n "$journal_errors" ]]; then
+        echo "--- Journal Errors (last 30 min, up to 50 lines) ---" >> "$report"
+        echo "$journal_errors" >> "$report"
+        echo "" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "Journal errors in last 30 minutes"
+    else
+        echo "--- Journal Errors (last 30 min): None ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 5. Docker container health
+    if command -v docker &>/dev/null; then
+        local docker_ps
+        docker_ps="$(docker ps -a --format \
+            'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null || true)"
+        echo "--- Docker Containers ---" >> "$report"
+        echo "$docker_ps" >> "$report"
+        echo "" >> "$report"
+
+        # Check for unhealthy containers
+        local unhealthy
+        unhealthy="$(docker ps --filter 'health=unhealthy' \
+            --format '{{.Names}}' 2>/dev/null || true)"
+        if [[ -n "$unhealthy" ]]; then
+            echo "--- Unhealthy Docker Containers ---" >> "$report"
+            echo "$unhealthy" >> "$report"
+            echo "" >> "$report"
+            issues=$((issues + 1))
+            add_warning "Diagnostic" "Unhealthy Docker containers: $(echo "$unhealthy" | tr '\n' ' ')"
+        fi
+
+        # Check for exited containers that should be running
+        local exited
+        exited="$(docker ps -a --filter 'status=exited' --filter 'status=dead' \
+            --format '{{.Names}} ({{.Status}})' 2>/dev/null || true)"
+        if [[ -n "$exited" ]]; then
+            echo "--- Exited/Dead Docker Containers ---" >> "$report"
+            echo "$exited" >> "$report"
+            echo "" >> "$report"
+            issues=$((issues + 1))
+            add_warning "Diagnostic" "Exited/dead Docker containers detected"
+        fi
+    else
+        echo "--- Docker: Not installed ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 6. Hermes gateway + doctor
+    if [[ -x "$HERMES_CLI" ]]; then
+        if pgrep -f 'hermes.*gateway run' >/dev/null 2>&1; then
+            echo "--- Hermes Gateway: Running ---" >> "$report"
+        else
+            echo "--- Hermes Gateway: DOWN ---" >> "$report"
+            issues=$((issues + 1))
+            add_error "Diagnostic" "Hermes gateway is DOWN"
+            log_error "Hermes gateway DOWN (diagnostic)"
+        fi
+
+        local hermes_doctor
+        hermes_doctor="$(run_hermes doctor 2>&1 || true)"
+        echo "--- Hermes Doctor ---" >> "$report"
+        echo "$hermes_doctor" >> "$report"
+        echo "" >> "$report"
+        if echo "$hermes_doctor" | grep -qiE 'fail|error|not found|missing'; then
+            issues=$((issues + 1))
+            add_warning "Diagnostic" "Hermes doctor reported problems"
+        fi
+    else
+        echo "--- Hermes: CLI not found ---" >> "$report"
+        echo "" >> "$report"
+    fi
+
+    # 7. Disk space (all mounts)
+    echo "--- Disk Usage ---" >> "$report"
+    df -h >> "$report" 2>&1
+    echo "" >> "$report"
+    local root_usage
+    root_usage="$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')"
+    if [[ -n "$root_usage" ]] && (( root_usage > 90 )); then
+        issues=$((issues + 1))
+        add_error "Diagnostic" "Disk usage critical: ${root_usage}% on /"
+    elif [[ -n "$root_usage" ]] && (( root_usage > 80 )); then
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "Disk usage high: ${root_usage}% on /"
+    fi
+
+    # 8. Memory
+    echo "--- Memory ---" >> "$report"
+    free -h >> "$report" 2>&1
+    echo "" >> "$report"
+    local mem_avail
+    mem_avail="$(free -m | awk '/^Mem:/ {print $7}')"
+    if [[ -n "$mem_avail" ]] && (( mem_avail < 256 )); then
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "Low available memory: ${mem_avail}MB"
+    fi
+
+    # 9. Network: default gateway reachability
+    local default_gw
+    default_gw="$(ip route show default 2>/dev/null | awk '{print $3; exit}' || true)"
+    if [[ -n "$default_gw" ]]; then
+        echo "--- Network: Gateway ($default_gw) ---" >> "$report"
+        if ping -c 1 -W 3 "$default_gw" >/dev/null 2>&1; then
+            echo "Gateway reachable: YES" >> "$report"
+        else
+            echo "Gateway reachable: NO" >> "$report"
+            issues=$((issues + 1))
+            add_warning "Diagnostic" "Default gateway ($default_gw) unreachable"
+        fi
+    else
+        echo "--- Network: No default gateway ---" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "No default gateway found"
+    fi
+    echo "" >> "$report"
+
+    # 10. DNS resolution
+    echo "--- DNS Resolution ---" >> "$report"
+    if nslookup github.com >/dev/null 2>&1 || \
+       getent hosts github.com >/dev/null 2>&1; then
+        echo "DNS resolution: OK" >> "$report"
+    else
+        echo "DNS resolution: FAILED" >> "$report"
+        issues=$((issues + 1))
+        add_warning "Diagnostic" "DNS resolution failed"
+    fi
+    echo "" >> "$report"
+
+    # 11. Listening ports (for awareness)
+    echo "--- Listening Ports (ss) ---" >> "$report"
+    ss -tlnp 2>/dev/null | head -30 >> "$report" || true
+    echo "" >> "$report"
+
+    # 12. dmesg errors (filesystem, hardware)
+    echo "--- dmesg Errors (last 20) ---" >> "$report"
+    dmesg --level=err,crit,alert,emerg 2>/dev/null | tail -20 >> "$report" || true
+    echo "" >> "$report"
+
+    # 13. Load average
+    echo "--- Load Average ---" >> "$report"
+    cat /proc/loadavg >> "$report"
+    echo "" >> "$report"
+
+    # Summary
+    echo "=== Diagnostic Summary: $issues issue(s) found ===" >> "$report"
+    log_info "Full diagnostic complete: $issues issue(s) found"
+    log_info "Diagnostic report: $report"
+
+    if (( issues > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+# ─── LLM Auto-Remediation ────────────────────────────────────────────────────
+
+# Safety check: block commands that could destroy data or make the system
+# unbootable. Returns 0 (safe) or 1 (blocked).
+#
+# The blocklist is intentionally conservative — it blocks commands that are
+# destructive and irreversible. Commands like `apt-get install -f` (fix broken
+# deps), `systemctl restart`, `docker restart`, `docker compose up -d`,
+# `hermes gateway run --replace`, `dpkg --configure -a` are all allowed.
+is_command_safe() {
+    local cmd="$1"
+
+    # Empty or whitespace-only
+    if [[ -z "$(echo "$cmd" | tr -d '[:space:]')" ]]; then
+        return 1
+    fi
+
+    # Blocklist — patterns that must never run automatically
+    # Each pattern is matched case-insensitively against the full command
+    local blocklist=(
+        'rm[[:space:]]+-rf[[:space:]]+/'
+        'rm[[:space:]]+-rf[[:space:]]+/\*'
+        'rm[[:space:]]+-fr[[:space:]]+/'
+        'mkfs'
+        'dd[[:space:]].*of=/dev/'
+        'shutdown'
+        'reboot'
+        'halt'
+        'poweroff'
+        'init[[:space:]]+0'
+        'init[[:space:]]+6'
+        'systemctl[[:space:]]+poweroff'
+        'systemctl[[:space:]]+reboot'
+        'fdisk'
+        'parted'
+        'wipefs'
+        'chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/'
+        'chown[[:space:]]+-R[[:space:]].*[[:space:]]+/$'
+        '>[[:space:]]*/dev/sd'
+        '>[[:space:]]*/dev/nvme'
+        '>[[:space:]]*/dev/vd'
+        ':[[:space:]]*\(\)[[:space:]]*\{.*\};:'  # fork bomb
+        'curl.*\|[[:space:]]*sh'
+        'curl.*\|[[:space:]]*bash'
+        'wget.*\|[[:space:]]*sh'
+        'wget.*\|[[:space:]]*bash'
+        'systemctl[[:space:]]+disable'
+        'systemctl[[:space:]]+mask'
+        'apt-get[[:space:]]+remove'
+        'apt-get[[:space:]]+purge'
+        'apt[[:space:]]+remove'
+        'apt[[:space:]]+purge'
+        'dpkg[[:space:]]+--remove'
+        'dpkg[[:space:]]+--purge'
+        'pip[[:space:]]+uninstall'
+        'npm[[:space:]]+uninstall'
+    )
+
+    local pattern
+    for pattern in "${blocklist[@]}"; do
+        if echo "$cmd" | grep -qiE "$pattern"; then
+            log_warn "Blocked unsafe command: $cmd (matched: $pattern)"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# Detect LLM API key from common locations if not set in config.
+# Checks (in order): config/env value, ~/.hermes/.env OPENROUTER_API_KEY,
+# ~/.hermes/.env OPENAI_API_KEY.
+detect_llm_api_key() {
+    if [[ -n "$LLM_API_KEY" ]]; then
+        return 0
+    fi
+
+    local env_file="${HERMES_USER_HOME:-/root}/.hermes/.env"
+    if [[ -f "$env_file" ]]; then
+        # Try OPENROUTER_API_KEY first (matches default LLM_API_URL)
+        local key
+        key="$(grep -E '^OPENROUTER_API_KEY=' "$env_file" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '\"' | tr -d "'")" || true
+        if [[ -n "$key" ]]; then
+            LLM_API_KEY="$key"
+            log_info "LLM API key detected from OPENROUTER_API_KEY in $env_file"
+            return 0
+        fi
+        # Fall back to OPENAI_API_KEY
+        key="$(grep -E '^OPENAI_API_KEY=' "$env_file" 2>/dev/null \
+            | head -1 | cut -d= -f2- | tr -d '\"' | tr -d "'")" || true
+        if [[ -n "$key" ]]; then
+            LLM_API_KEY="$key"
+            log_info "LLM API key detected from OPENAI_API_KEY in $env_file"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Send the diagnostic report to an LLM and get remediation commands back.
+# Writes suggested commands to stdout (one per line, prefixed with "CMD: ").
+# Returns 0 on success, 1 on failure.
+llm_get_remediation() {
+    local report_content="$1"
+
+    if ! detect_llm_api_key; then
+        log_warn "LLM remediation skipped: no API key found (set LLM_API_KEY in config or OPENROUTER_API_KEY/OPENAI_API_KEY in ~/.hermes/.env)"
+        add_warning "LLM Remediation" "No API key found — skipped"
+        return 1
+    fi
+
+    local system_prompt
+    system_prompt="You are a Linux SRE diagnostic assistant. You receive a system diagnostic report after an automatic update. Your job is to identify issues and suggest remediation commands. Rules:
+1. Only suggest shell commands that fix the identified issues.
+2. Each command must be on its own line, prefixed with 'CMD: '.
+3. Only suggest safe, non-destructive commands (no rm -rf, mkfs, dd, shutdown, reboot, purge, etc.).
+4. Prefer: systemctl restart <unit>, docker restart <container>, docker compose up -d, apt-get install -f, dpkg --configure -a, hermes gateway run --replace, hermes doctor, etc.
+5. If no remediation is needed, output 'NO_REMEDIATION_NEEDED'.
+6. Do not suggest interactive commands.
+7. Maximum 10 commands."
+
+    local user_prompt
+    user_prompt="Diagnostic report:\n\n${report_content}\n\nSuggest remediation commands:"
+
+    # Build JSON payload using python3 for safe escaping
+    local payload
+    payload="$(python3 -c "
+import json, sys
+msg = {
+    'model': sys.argv[1],
+    'messages': [
+        {'role': 'system', 'content': sys.argv[2]},
+        {'role': 'user', 'content': sys.argv[3]}
+    ],
+    'temperature': 0.3,
+    'max_tokens': 2000
+}
+print(json.dumps(msg))
+" "$LLM_MODEL" "$system_prompt" "$user_prompt" 2>/dev/null)" || {
+        log_error "Failed to build LLM API request payload"
+        return 1
+    }
+
+    log_info "Requesting LLM remediation suggestions (model: $LLM_MODEL)..."
+
+    local response_file
+    response_file="$(mktemp)"
+
+    local http_code
+    http_code="$(curl -s -o "$response_file" -w '%{http_code}' \
+        --max-time "$LLM_TIMEOUT" \
+        -X POST "$LLM_API_URL" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $LLM_API_KEY" \
+        -d "$payload" 2>/dev/null || echo "000")"
+
+    if [[ "$http_code" != "200" ]]; then
+        log_error "LLM API returned HTTP $http_code"
+        add_error "LLM Remediation" "API request failed (HTTP $http_code)"
+        cat "$response_file" >> "$LOG_FILE" 2>/dev/null || true
+        rm -f "$response_file"
+        return 1
+    fi
+
+    # Extract the assistant's message content
+    local llm_response
+    llm_response="$(python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d['choices'][0]['message']['content'])
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" < "$response_file" 2>>"$LOG_FILE")" || {
+        log_error "Failed to parse LLM response"
+        add_error "LLM Remediation" "Failed to parse API response"
+        rm -f "$response_file"
+        return 1
+    }
+
+    rm -f "$response_file"
+
+    # Log the full LLM response
+    log_info "LLM response:"
+    echo "$llm_response" >> "$LOG_FILE"
+
+    # Check if LLM says no remediation needed
+    if echo "$llm_response" | grep -qi 'NO_REMEDIATION_NEEDED'; then
+        log_info "LLM determined no remediation is needed"
+        return 1
+    fi
+
+    # Extract CMD: lines
+    local commands
+    commands="$(echo "$llm_response" | grep '^CMD: ' | sed 's/^CMD: //' || true)"
+    if [[ -z "$commands" ]]; then
+        log_warn "LLM did not suggest any remediation commands"
+        return 1
+    fi
+
+    echo "$commands"
+    return 0
+}
+
+# Run the full diagnostic, then if issues are found, ask the LLM for
+# remediation commands, safety-check each, execute safe ones, and
+# re-run the diagnostic. Repeat up to LLM_MAX_REMEDIATION_ATTEMPTS times.
+run_diagnostic_and_remediate() {
+    if [[ "$DIAGNOSTIC_ENABLED" != "true" ]]; then
+        log_info "Full diagnostic disabled, skipping"
+        return 0
+    fi
+
+    local attempt=0
+    local max_attempts="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
+
+    while (( attempt < max_attempts )); do
+        attempt=$((attempt + 1))
+
+        # Run diagnostic
+        if run_full_diagnostic; then
+            log_info "Diagnostic passed — no issues found (attempt $attempt)"
+            return 0
+        fi
+
+        # Issues found
+        log_warn "Diagnostic found issues (attempt $attempt/$max_attempts)"
+
+        if [[ "$LLM_REMEDIATION_ENABLED" != "true" ]]; then
+            log_warn "LLM remediation is disabled — issues left unresolved"
+            add_warning "Diagnostic" "Issues found but LLM remediation disabled"
+            return 1
+        fi
+
+        if (( attempt == max_attempts )); then
+            log_warn "Max remediation attempts reached ($max_attempts)"
+            add_warning "Diagnostic" "Unresolved issues after $max_attempts remediation attempts"
+            return 1
+        fi
+
+        # Read diagnostic report
+        local report_content
+        report_content="$(cat "$DIAGNOSTIC_REPORT" 2>/dev/null || true)"
+        if [[ -z "$report_content" ]]; then
+            log_error "Diagnostic report is empty"
+            return 1
+        fi
+
+        # Ask LLM for remediation
+        local remediation_cmds
+        remediation_cmds="$(llm_get_remediation "$report_content")" || {
+            log_warn "LLM remediation did not produce commands (attempt $attempt)"
+            # If the LLM said no remediation needed, stop
+            return 1
+        }
+
+        local cmd
+        local executed=0
+        local blocked=0
+
+        while IFS= read -r cmd; do
+            [[ -z "$cmd" ]] && continue
+            # Strip leading/trailing whitespace
+            cmd="$(echo "$cmd" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [[ -z "$cmd" ]] && continue
+
+            if ! is_command_safe "$cmd"; then
+                blocked=$((blocked + 1))
+                add_warning "LLM Remediation" "Blocked unsafe command: $cmd"
+                continue
+            fi
+
+            log_info "Executing remediation command: $cmd"
+            if eval "$cmd" >>"$LOG_FILE" 2>&1; then
+                log_info "Remediation command succeeded: $cmd"
+                executed=$((executed + 1))
+            else
+                log_warn "Remediation command failed: $cmd"
+                add_warning "LLM Remediation" "Command failed: $cmd"
+            fi
+        done <<< "$remediation_cmds"
+
+        log_info "Remediation round $attempt: $executed executed, $blocked blocked"
+
+        if (( executed == 0 )); then
+            log_warn "No safe remediation commands executed (attempt $attempt)"
+            add_warning "LLM Remediation" "No safe commands to execute in round $attempt"
+            return 1
+        fi
+
+        # Wait briefly for services to settle before re-diagnosing
+        sleep 5
+    done
+
+    return 1
+}
+
 # ─── Reboot scheduling (deferred to end of run) ──────────────────────────────
 
 schedule_reboot_if_required() {
@@ -877,6 +1428,9 @@ main() {
 
     # Health checks
     run_health_checks
+
+    # Full diagnostic + LLM auto-remediation
+    run_diagnostic_and_remediate || true
 
     # Final assessment
     log_info "========================================"

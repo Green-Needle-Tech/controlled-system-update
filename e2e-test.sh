@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# e2e-test.sh — End-to-end test for controlled-system-update v2.5.0
+# e2e-test.sh — End-to-end test for controlled-system-update v2.6.0
 # Tests: file layout, config, systemd units, script syntax, lock contention,
-# logging, health checks, Telegram notification path
+# logging, health checks, diagnostic + LLM remediation, Telegram notification path
 #
 # Destructive tests (real system updates) are gated behind RUN_DESTRUCTIVE_TESTS=true
 # CI should use mocked commands and a temporary CSU_CONFIG, not real package upgrades.
@@ -23,7 +23,7 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 TEST_CONFIG="${TEST_CONFIG:-/tmp/csu-test-config.conf}"
 
 echo "=========================================="
-echo "E2E Test: controlled-system-update v2.5.0"
+echo "E2E Test: controlled-system-update v2.6.0"
 echo "Host: $(hostname -s)"
 echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "=========================================="
@@ -93,10 +93,10 @@ done
 
 # SKILL.md version
 skill_version=$(grep '^version:' "$REPO/SKILL.md" | sed 's/version: *//' | tr -d '"')
-if [[ "$skill_version" == "2.5.0" ]]; then
-    pass "SKILL.md version is 2.5.0"
+if [[ "$skill_version" == "2.6.0" ]]; then
+    pass "SKILL.md version is 2.6.0"
 else
-    fail "SKILL.md version is '$skill_version' (expected 2.5.0)"
+    fail "SKILL.md version is '$skill_version' (expected 2.6.0)"
 fi
 
 # ─── 3. Config Content ───────────────────────────────────────────────────────
@@ -239,7 +239,7 @@ else
     TG_CHAT="$TG_CHAT_ID"
 
     # Test 6a: Success message
-    test_msg="[E2E TEST] controlled-system-update v2.5.0 — test notification from $(hostname -s)"
+    test_msg="[E2E TEST] controlled-system-update v2.6.0 — test notification from $(hostname -s)"
     http_code=$(curl -s -o /tmp/tg_test_response.json -w '%{http_code}' \
         -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT}" \
@@ -473,13 +473,107 @@ echo "--- 12. Local Skill Version ---"
 local_skill="${HERMES_HOME:-${HOME:-/root}/.hermes}/skills/devops/controlled-system-update/SKILL.md"
 if [[ -f "$local_skill" ]]; then
     local_skill_version=$(grep '^version:' "$local_skill" | sed 's/version: *//' | tr -d '"')
-    if [[ "$local_skill_version" == "2.5.0" ]]; then
-        pass "Local skill updated to v2.5.0"
+    if [[ "$local_skill_version" == "2.6.0" ]]; then
+        pass "Local skill updated to v2.6.0"
     else
-        warn "Local skill version is '$local_skill_version' (expected 2.5.0)"
+        warn "Local skill version is '$local_skill_version' (expected 2.6.0)"
     fi
 else
     warn "Local skill file missing at $local_skill (may not be installed on this host)"
+fi
+
+# ─── 13. Diagnostic + LLM Remediation Feature ──────────────────────────────
+
+echo ""
+echo "--- 13. Diagnostic + LLM Remediation Feature ---"
+
+# Check that the diagnostic functions exist in the script
+if grep -q 'run_full_diagnostic()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "run_full_diagnostic function exists in auto-update.sh"
+else
+    fail "run_full_diagnostic function missing from auto-update.sh"
+fi
+
+if grep -q 'llm_get_remediation()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "llm_get_remediation function exists in auto-update.sh"
+else
+    fail "llm_get_remediation function missing from auto-update.sh"
+fi
+
+if grep -q 'run_diagnostic_and_remediate()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "run_diagnostic_and_remediate function exists in auto-update.sh"
+else
+    fail "run_diagnostic_and_remediate function missing from auto-update.sh"
+fi
+
+if grep -q 'is_command_safe()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "is_command_safe function exists in auto-update.sh"
+else
+    fail "is_command_safe function missing from auto-update.sh"
+fi
+
+# Check that diagnostic+remediation is called in main()
+if grep -q 'run_diagnostic_and_remediate' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "Diagnostic+remediation is wired into main()"
+else
+    fail "Diagnostic+remediation is not wired into main()"
+fi
+
+# Check config options exist in the template
+for opt in DIAGNOSTIC_ENABLED LLM_REMEDIATION_ENABLED LLM_API_URL LLM_MODEL LLM_TIMEOUT LLM_MAX_REMEDIATION_ATTEMPTS; do
+    if grep -q "^${opt}=" "$REPO/config/auto-update.conf" 2>/dev/null; then
+        pass "Config option $opt exists in template"
+    else
+        fail "Config option $opt missing from template"
+    fi
+done
+
+# Verify the safety blocklist blocks dangerous commands
+# Check that the blocklist patterns are present in the script
+if grep -q 'rm.*-rf.*/' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'mkfs' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'shutdown' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'reboot' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'dd.*of=/dev/' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'curl.*sh' "$REPO/scripts/auto-update.sh" && \
+   grep -q 'apt-get.*purge' "$REPO/scripts/auto-update.sh"; then
+    pass "Safety blocklist covers destructive commands (rm -rf, mkfs, dd, shutdown, reboot, curl|sh, purge)"
+else
+    fail "Safety blocklist is missing destructive command patterns"
+fi
+
+# Check that LLM API key auto-detection is present
+if grep -q 'OPENROUTER_API_KEY' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "LLM API key auto-detection (OPENROUTER_API_KEY) present"
+else
+    fail "LLM API key auto-detection missing"
+fi
+
+if grep -q 'OPENAI_API_KEY' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "LLM API key fallback (OPENAI_API_KEY) present"
+else
+    fail "LLM API key fallback missing"
+fi
+
+# Verify diagnostic report path is configured
+if grep -q 'DIAGNOSTIC_REPORT' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "Diagnostic report path configured"
+else
+    fail "Diagnostic report path not configured"
+fi
+
+# Check README documents the feature
+if grep -qi 'Full Diagnostic.*LLM.*Remediation' "$REPO/README.md" 2>/dev/null; then
+    pass "README documents diagnostic + LLM remediation feature"
+else
+    fail "README does not document diagnostic + LLM remediation feature"
+fi
+
+# Check CHANGELOG has v2.6.0 entry
+if grep -q '\[2.6.0\]' "$REPO/CHANGELOG.md" 2>/dev/null; then
+    pass "CHANGELOG has v2.6.0 entry"
+else
+    fail "CHANGELOG missing v2.6.0 entry"
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

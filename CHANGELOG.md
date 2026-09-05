@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [2.6.0] - 2026-09-05
+
+### Added
+- Full post-update diagnostic (`run_full_diagnostic`): dpkg audit, apt-get check for broken dependencies, systemd failed units, journal errors (last 30 min), Docker container health (unhealthy + exited/dead), Hermes gateway status + `hermes doctor`, disk usage (all mounts), memory, network gateway reachability, DNS resolution, listening ports summary, dmesg errors, load average
+- LLM-based auto-remediation (`llm_get_remediation`, `run_diagnostic_and_remediate`): sends diagnostic report to an OpenAI-compatible LLM API, parses suggested remediation commands, safety-checks each against a blocklist, executes safe ones, re-runs the diagnostic — repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` (default: 3) rounds
+- Command safety blocklist (`is_command_safe`): blocks `rm -rf /`, `mkfs`, `dd of=/dev/`, `shutdown`, `reboot`, `halt`, `fdisk`, `parted`, `wipefs`, `chmod -R 777 /`, fork bombs, `curl|sh`, `apt-get remove/purge`, `systemctl disable/mask`, `pip/npm uninstall`, and other destructive patterns
+- LLM API key auto-detection from `~/.hermes/.env` (`OPENROUTER_API_KEY` then `OPENAI_API_KEY`)
+- New config options: `DIAGNOSTIC_ENABLED`, `LLM_REMEDIATION_ENABLED`, `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT`, `LLM_MAX_REMEDIATION_ATTEMPTS`
+- Diagnostic report saved to `/var/log/controlled-system-update/diagnostic-report.txt`
+- README and SKILL.md documentation for the diagnostic + remediation feature
+
+### Security
+- LLM-suggested commands are validated against a conservative blocklist before execution — destructive commands (rm -rf, mkfs, dd, shutdown, reboot, purge, curl|sh, etc.) are blocked and logged
+- LLM API key is never exported to child processes (loaded via direct variable assignment, not `set -a`)
+
 ## [2.5.0] - 2026-09-03
 
 ### Fixed

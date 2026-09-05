@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 2.5.0
+version: 2.6.0
 platforms: [linux]
 metadata:
   hermes:
@@ -85,6 +85,35 @@ Key settings:
 - `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
 - `HERMES_SKILLS_SCOPE` — include all Hermes-managed sources: GitHub, URL, tap, hub, community (default: all)
 - `HERMES_SKILLS_TIMEOUT` — timeout for skill operations in seconds (default: 600)
+- `DIAGNOSTIC_ENABLED` — run comprehensive post-update diagnostic (default: true)
+- `LLM_REMEDIATION_ENABLED` — attempt LLM-based auto-remediation when diagnostic finds issues (default: true)
+- `LLM_API_URL` — OpenAI-compatible chat completions endpoint (default: OpenRouter)
+- `LLM_MODEL` — model to use for remediation suggestions (default: z-ai/glm-5.2)
+- `LLM_API_KEY` — API key; auto-detected from `~/.hermes/.env` (OPENROUTER_API_KEY or OPENAI_API_KEY) if not set
+- `LLM_TIMEOUT` — timeout for each LLM API request in seconds (default: 120)
+- `LLM_MAX_REMEDIATION_ATTEMPTS` — maximum diagnose→remediate→re-diagnose rounds (default: 3)
+
+### Full Diagnostic + LLM Auto-Remediation
+
+After all update phases and basic health checks, the script runs a comprehensive diagnostic that covers:
+
+1. **dpkg audit** — half-installed/broken packages
+2. **apt-get check** — broken dependencies
+3. **systemd failed units** — detailed list
+4. **Journal errors** — last 30 minutes, priority err and above
+5. **Docker container health** — unhealthy and exited/dead containers
+6. **Hermes gateway** — running status + `hermes doctor`
+7. **Disk usage** — all mounts, alert at >80% critical >90%
+8. **Memory** — available memory, alert at <256MB
+9. **Network** — default gateway reachability (ping)
+10. **DNS** — resolution test
+11. **Listening ports** — summary via `ss`
+12. **dmesg errors** — filesystem/hardware errors
+13. **Load average**
+
+If the diagnostic finds issues and `LLM_REMEDIATION_ENABLED=true`, the report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands. Each command is safety-checked against a blocklist (no `rm -rf /`, `mkfs`, `dd`, `shutdown`, `reboot`, `purge`, `curl | sh`, etc.) before execution. The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times, re-running the diagnostic after each remediation round.
+
+The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
 
 ### Manual operations
 

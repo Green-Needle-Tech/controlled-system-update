@@ -2,6 +2,8 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
+**v2.6.0** — Full post-update diagnostic + LLM auto-remediation: after all update phases, a comprehensive diagnostic (dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg, Hermes doctor) runs automatically. If issues are found, the report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands — each safety-checked against a blocklist before execution. The cycle repeats up to 3 times.
+
 **v2.5.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime, and all hermes commands run as the repo-owning user via `runuser` — fixes git's "dubious ownership" error when the systemd service runs as root but Hermes is installed for a regular user (e.g. /home/ubuntu).
 
 ## What It Updates
@@ -15,6 +17,8 @@ The automatic mode updates the following by default:
 | Docker images | Pull latest for running containers, recreate via Compose if changed | enabled |
 | Hermes Agent | `hermes update --yes` (supported updater) | enabled |
 | Hermes external skills | `hermes skills check` (report only) | enabled |
+| Full diagnostic | dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg | enabled |
+| LLM auto-remediation | Send diagnostic to LLM, safety-check + execute suggested commands | enabled |
 | Python/uv tools | uv tool upgrade | **opt-in** |
 | npm global packages | npm update -g | **opt-in** |
 | dist-upgrade | apt-get dist-upgrade | **opt-in** |
@@ -117,7 +121,34 @@ HERMES_SKILLS_MODE="check"
 HERMES_SKILLS_AUDIT="true"
 HERMES_SKILLS_SCOPE="all"
 HERMES_SKILLS_TIMEOUT="600"
+
+# Full diagnostic + LLM auto-remediation
+DIAGNOSTIC_ENABLED="true"
+LLM_REMEDIATION_ENABLED="true"
+LLM_API_URL="https://openrouter.ai/api/v1/chat/completions"
+LLM_MODEL="z-ai/glm-5.2"
+# LLM_API_KEY=""  # auto-detected from ~/.hermes/.env
+LLM_TIMEOUT="120"
+LLM_MAX_REMEDIATION_ATTEMPTS="3"
 ```
+
+## Full Diagnostic + LLM Auto-Remediation
+
+After all update phases and basic health checks, the script runs a comprehensive diagnostic:
+
+- **dpkg audit** — half-installed/broken packages
+- **apt-get check** — broken dependencies
+- **systemd failed units** — detailed list
+- **Journal errors** — last 30 minutes
+- **Docker container health** — unhealthy and exited/dead containers
+- **Hermes gateway** — running status + `hermes doctor`
+- **Disk/memory** — all mounts, available memory
+- **Network** — default gateway reachability + DNS resolution
+- **dmesg errors** — filesystem/hardware errors
+
+If issues are found and `LLM_REMEDIATION_ENABLED=true`, the diagnostic report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands. Each command is safety-checked against a blocklist (no `rm -rf /`, `mkfs`, `dd`, `shutdown`, `reboot`, `purge`, `curl | sh`, etc.) before execution. The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times.
+
+The LLM API key is auto-detected from `~/.hermes/.env` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`). The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
 
 ## Usage
 
