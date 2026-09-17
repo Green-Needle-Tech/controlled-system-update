@@ -2,13 +2,21 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v3.0.1** — Fixes a deadlock: `hermes gateway restart` drains in-flight agent turns, so issuing it from *inside* an agent session made the gateway wait for the calling process while the calling process waited for the gateway. Now guarded, with its own timeout budget.
+Runs unattended once a day: OS packages, Snap, Docker images, Hermes Agent and
+Hermes skills — then verifies the host and reports only when something needs
+your attention.
 
-**v3.0.0** — Incident-driven hardening. Remediation is now **allowlist-gated** (a command must match a known-safe form before the blocklist is even consulted), `eval` is gone, shell metacharacters are rejected, and every command has a hard timeout. Adds **Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support, and splits diagnostic findings into *actionable* vs *advisory* so journal noise no longer triggers nightly remediation churn. See [CHANGELOG](CHANGELOG.md#300---2026-09-17) for the two production root causes this release fixes.
+- **[SPEC.md](SPEC.md)** — full specification: guarantees, safety model, incident history
+- **[SKILL.md](SKILL.md)** — Hermes agent skill + manual SRE procedure
+- **[CHANGELOG.md](CHANGELOG.md)** — version history
 
-**v2.6.0** — Full post-update diagnostic + LLM auto-remediation: after all update phases, a comprehensive diagnostic (dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg, Hermes doctor) runs automatically.
-
-**v2.5.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime, and all hermes commands run as the repo-owning user via `runuser` — fixes git's "dubious ownership" error when the systemd service runs as root but Hermes is installed for a regular user (e.g. /home/ubuntu).
+**Latest — v3.0.1.** LLM remediation is **allowlist-gated**: a command must
+match a known-safe form before the blocklist is even consulted, `eval` is
+gone, shell metacharacters are rejected and every command is time-bounded.
+Adds **Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support, and splits
+diagnostic findings into *actionable* vs *advisory* so journal noise no longer
+triggers nightly remediation churn. The 3.0.x line was driven by three real
+production defects — see [incident history](SPEC.md#8-incident-history).
 
 ## Supported Platforms
 
@@ -206,8 +214,9 @@ Additionally:
 - Commands are executed **without `eval`**, as an argv array.
 - Each command runs under a hard `REMEDIATION_CMD_TIMEOUT`, so one hung command cannot consume the systemd unit's whole time budget.
 - Text that looks like a log line is rejected as a command.
+- An allowlisted `hermes gateway restart` is routed through a guarded helper, so it cannot deadlock when the tool runs inside a Hermes agent session (see [SPEC §8.3](SPEC.md#83-gateway-restart-deadlock-2026-09-17)).
 
-The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times. These gates are covered by 44 assertions in `tests/safety-gate-test.sh`, run in CI.
+The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times. These gates are covered by 46 assertions in `tests/safety-gate-test.sh`, run in CI on amd64 and arm64.
 
 The LLM API key is auto-detected from `~/.hermes/.env` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`). The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
 
@@ -272,6 +281,7 @@ Every message carries the host label, timestamp and platform (OS, version, archi
 - **Allowlist-gated remediation** — see above; no `eval`, no metacharacters, per-command timeout
 - **Precise gateway detection** — matches the real interpreter invocation and systemd unit state, not any process whose command line merely mentions "hermes gateway run"
 - **Partial-update recovery** — a `hermes update` that pulls successfully but fails its own gateway relaunch is recovered with a bounded `hermes gateway restart` rather than failing the run
+- **Deadlock guard** — the gateway restart drains in-flight agent turns, so it is skipped (with a warning) when the tool runs inside a Hermes agent session; the systemd timer path is unaffected
 - **Deferred reboot** — reboot scheduling occurs only after all update and verification phases
 - **needrestart** — automatically restarts services after library upgrades (if installed)
 - **Log rotation** — auto-deletes log files older than 30 days (configurable)
@@ -289,6 +299,7 @@ Every message carries the host label, timestamp and platform (OS, version, archi
 controlled-system-update/
 ├── .github/workflows/lint.yml         # ShellCheck + safety gate + arch matrix + unit checks
 ├── CHANGELOG.md                       # Version history
+├── SPEC.md                            # Specification: guarantees, safety model, incidents
 ├── SKILL.md                           # Full SRE procedure + auto-mode docs
 ├── README.md                          # This file
 ├── LICENSE                            # MIT
