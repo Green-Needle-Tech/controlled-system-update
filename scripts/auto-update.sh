@@ -233,17 +233,93 @@ LLM_API_KEY="${LLM_API_KEY:-}"
 LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
 LLM_MAX_REMEDIATION_ATTEMPTS="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
 
+# Hard timeout for each individual remediation command. Any command that
+# outlives it is killed, so a single hung command can never consume the
+# whole TimeoutStartSec budget of the systemd unit.
+REMEDIATION_CMD_TIMEOUT="${REMEDIATION_CMD_TIMEOUT:-120}"
+
+# Notification policy:
+#   error   — notify only on errors (quietest)
+#   warning — notify on errors and warnings (default, legacy behaviour)
+#   always  — always send a run summary
+NOTIFY_LEVEL="${NOTIFY_LEVEL:-warning}"
+
+# Advisory diagnostic findings are recorded in the report and (optionally)
+# the notification, but do NOT trigger LLM remediation. Journal noise and
+# a disk at 81% are not things a model should try to "fix" at 04:00.
+# Space-separated subset of: journal disk memory load dns ports dmesg
+DIAGNOSTIC_ADVISORY="${DIAGNOSTIC_ADVISORY:-journal memory load}"
+
+# Remediate only when an actionable issue is present (broken packages,
+# failed units, dead containers, gateway down). Set to false to restore
+# the pre-3.0 behaviour of remediating on any finding at all.
+REMEDIATE_ON_ACTIONABLE_ONLY="${REMEDIATE_ON_ACTIONABLE_ONLY:-true}"
+
 # Diagnostic report file (written by run_full_diagnostic, read by llm_remediate)
 DIAGNOSTIC_REPORT="${LOG_DIR}/diagnostic-report.txt"
 
+# ─── Platform detection ──────────────────────────────────────────────────────
+#
+# Supported: Debian/Ubuntu on amd64 and arm64, Ubuntu 22.04 through 26.04 LTS
+# (Resolute Raccoon) and later. Everything below is derived at runtime — the
+# script must never assume x86_64, a specific apt generation, or GNU coreutils
+# (Ubuntu 25.10+ ships Rust uutils coreutils by default).
+
+OS_ID="$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-unknown}")"
+OS_VERSION_ID="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-0}")"
+OS_CODENAME="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-unknown}")"
+HOST_ARCH="$(uname -m)"
+if command -v dpkg &>/dev/null; then
+    DPKG_ARCH="$(dpkg --print-architecture 2>/dev/null || printf 'unknown')"
+else
+    DPKG_ARCH="unknown"
+fi
+
+# apt major generation. Ubuntu 26.04 ships apt 3.x (new solver3 resolver,
+# columnar output, `apt history-undo`). apt-get remains the stable scripting
+# interface in both generations, which is why every call below uses apt-get.
+APT_MAJOR=0
+if command -v apt-get &>/dev/null; then
+    APT_MAJOR="$(apt-get --version 2>/dev/null | awk 'NR==1 {split($2, v, "."); print v[1]}')"
+    [[ "$APT_MAJOR" =~ ^[0-9]+$ ]] || APT_MAJOR=0
+fi
+
+# Phased updates: Ubuntu rolls some updates out to a fraction of machines.
+# A fleet that silently diverges is harder to reason about than one that
+# takes phased updates uniformly, but forcing them is a policy choice.
+INCLUDE_PHASED_UPDATES="${INCLUDE_PHASED_UPDATES:-false}"
+
+# Common apt-get options for every invocation in this script.
+apt_opts() {
+    printf '%s\n' \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        -o Dpkg::Use-Pty=0
+    if [[ "$INCLUDE_PHASED_UPDATES" == "true" ]]; then
+        printf '%s\n' -o APT::Get::Always-Include-Phased-Updates=true
+    fi
+}
+
+# Reboot marker. /var/run is a symlink to /run on every modern systemd
+# distribution, but checking both is free and survives odd images.
+reboot_is_required() {
+    [[ -f /run/reboot-required || -f /var/run/reboot-required ]]
+}
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
+# All log output goes to stderr on purpose. Several helpers return data on
+# stdout via command substitution (llm_get_remediation, detect_* helpers);
+# logging to stdout would splice log lines into that data. This was the root
+# cause of the 2026-09-16 incident, where "[INFO] LLM response:" was captured
+# as a remediation command and executed. main() merges stderr into the log
+# file, so nothing is lost.
 log() {
     local level="$1"; shift
     local msg="$*"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[${ts}] [${level}] ${msg}"
+    echo "[${ts}] [${level}] ${msg}" >&2
 }
 
 log_info()  { log "INFO"  "$@"; }
@@ -326,21 +402,26 @@ update_os_packages() {
         return 1
     fi
 
-    log_info "Running apt-get upgrade..."
+    log_info "Running apt-get upgrade (apt ${APT_MAJOR}.x, ${DPKG_ARCH})..."
+    local -a apt_flags
+    mapfile -t apt_flags < <(apt_opts)
     if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confold" \
+        "${apt_flags[@]}" \
         >> "$LOG_FILE" 2>&1; then
         add_error "OS" "apt-get upgrade failed"
         log_error "apt-get upgrade failed"
+        if (( APT_MAJOR >= 3 )); then
+            # apt 3.x (Ubuntu 26.04+) records transactions and can roll back.
+            log_error "Rollback available: apt history-info 0 / sudo apt history-undo 0"
+            add_error "OS" "Rollback available on apt 3.x: 'apt history-info 0' then 'sudo apt history-undo 0'"
+        fi
         return 1
     fi
 
     if [[ "$DIST_UPGRADE" == "true" ]]; then
         log_info "Running apt-get dist-upgrade (DIST_UPGRADE=true)..."
         if ! DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
+            "${apt_flags[@]}" \
             >> "$LOG_FILE" 2>&1; then
             add_error "OS" "apt-get dist-upgrade failed"
             log_error "apt-get dist-upgrade failed"
@@ -386,9 +467,13 @@ update_os_packages() {
     fi
 
     # Record whether a reboot is required — do not act on it yet
-    if [[ -f /var/run/reboot-required ]]; then
+    if reboot_is_required; then
         REBOOT_REQUIRED=true
-        log_warn "System reboot is required"
+        local reboot_pkgs=""
+        if [[ -f /run/reboot-required.pkgs ]]; then
+            reboot_pkgs="$(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
+        fi
+        log_warn "System reboot is required${reboot_pkgs:+ (packages: ${reboot_pkgs})}"
     fi
 
     log_info "OS package update complete"
@@ -464,8 +549,19 @@ update_docker_images() {
         # Standalone container — pull and check for updates
         # Do NOT classify images without '/' as local; official Docker Hub images
         # like nginx:latest, postgres:17, redis:alpine are valid registry images.
-        log_info "Pulling image: $image (container: $name)"
-        if docker pull "$image" >> "$LOG_FILE" 2>&1; then
+        # Pin the pull to this host's architecture. Multi-arch manifests
+        # normally resolve correctly on their own, but being explicit keeps
+        # mixed amd64/arm64 fleets from silently pulling an emulated image
+        # when a manifest list is incomplete.
+        local pull_platform=""
+        case "$DPKG_ARCH" in
+            amd64) pull_platform="linux/amd64" ;;
+            arm64) pull_platform="linux/arm64" ;;
+            armhf) pull_platform="linux/arm/v7" ;;
+        esac
+
+        log_info "Pulling image: $image (container: $name${pull_platform:+, ${pull_platform}})"
+        if docker pull ${pull_platform:+--platform "$pull_platform"} "$image" >> "$LOG_FILE" 2>&1; then
             local new_id old_id
             new_id="$(docker inspect --format '{{.Id}}' "$image" 2>/dev/null || echo "")"
             old_id="$(docker inspect --format '{{.Image}}' "$name" 2>/dev/null || echo "")"
@@ -559,6 +655,55 @@ run_hermes_with_timeout() {
         "$HERMES_CLI" "$@"
 }
 
+# Detect a genuinely running Hermes gateway.
+#
+# `pgrep -f 'hermes.*gateway run'` is too loose: it matches any shell whose
+# command line merely mentions those words (an admin grepping the logs, this
+# script's own subshell, an agent session running a diagnostic). A false
+# positive hides a dead gateway; a false negative triggers a pointless
+# restart. Match the actual interpreter invocation, and accept the systemd
+# user unit as an equally authoritative signal.
+gateway_is_running() {
+    if pgrep -f 'hermes_cli\.main[[:space:]]+gateway[[:space:]]+run' >/dev/null 2>&1; then
+        return 0
+    fi
+    # python -m hermes_cli.main gateway run may appear with a full venv path
+    if pgrep -f 'venv/bin/python.*gateway[[:space:]]+run' >/dev/null 2>&1; then
+        return 0
+    fi
+    # systemd user unit (root-owned installs typically use this)
+    if command -v systemctl &>/dev/null; then
+        if systemctl --user is-active --quiet hermes-gateway.service 2>/dev/null; then
+            return 0
+        fi
+        if systemctl is-active --quiet hermes-gateway.service 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Restart the gateway through the supported, BOUNDED command.
+#
+# Never `hermes gateway run --replace` from this script: it runs in the
+# foreground and will hold the systemd unit open until TimeoutStartSec
+# kills the whole update (the 2026-09-16 failure).
+restart_hermes_gateway() {
+    [[ -x "$HERMES_CLI" ]] || return 1
+    log_info "Restarting Hermes gateway (bounded)..."
+    if run_hermes_with_timeout gateway restart >>"$LOG_FILE" 2>&1; then
+        sleep 5
+        if gateway_is_running; then
+            log_info "Hermes gateway restarted successfully"
+            return 0
+        fi
+        log_warn "Hermes gateway restart returned success but no gateway is running"
+        return 1
+    fi
+    log_warn "Hermes gateway restart command failed"
+    return 1
+}
+
 update_hermes_agent() {
     log_info "=== Hermes Agent Update ==="
 
@@ -577,24 +722,56 @@ update_hermes_agent() {
     log_info "Current Hermes version: $old_version"
 
     log_info "Running supported Hermes updater (as user: $HERMES_USER)..."
-    if ! hermes_privileged_cmd timeout \
+    local update_rc=0
+    hermes_privileged_cmd timeout \
         --signal=TERM \
         --kill-after=30s \
         "$HERMES_UPDATE_TIMEOUT" \
         env \
         HOME="$HERMES_USER_HOME" \
         HERMES_HOME="$HERMES_HOME" \
-        "$HERMES_CLI" update --yes >>"$LOG_FILE" 2>&1; then
-        add_error "Hermes" "hermes update failed or timed out"
-        log_error "Hermes update failed"
-        return 1
-    fi
+        "$HERMES_CLI" update --yes >>"$LOG_FILE" 2>&1 || update_rc=$?
 
     new_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
+
+    if (( update_rc != 0 )); then
+        # A very common partial failure: the new code IS pulled and installed,
+        # but the updater's own gateway relaunch or dashboard cleanup crashed
+        # (e.g. an ImportError from mixed sys.modules against the new
+        # checkout). The checkout is fine; only the running processes are
+        # stale. A bounded `hermes gateway restart` recovers this without
+        # human intervention — retrying `hermes update` would not.
+        if (( update_rc == 124 || update_rc == 137 )); then
+            add_error "Hermes" "hermes update timed out after ${HERMES_UPDATE_TIMEOUT}s"
+            log_error "Hermes update timed out"
+            return 1
+        fi
+
+        log_warn "hermes update exited non-zero (rc=$update_rc) — attempting gateway recovery"
+        if restart_hermes_gateway; then
+            add_warning "Hermes" \
+                "hermes update exited $update_rc but the code was pulled and the gateway restarted cleanly (recovered)"
+            log_info "Recovered from partial Hermes update failure"
+        else
+            add_error "Hermes" "hermes update failed (rc=$update_rc) and gateway recovery did not succeed"
+            log_error "Hermes update failed and could not be recovered"
+            return 1
+        fi
+    fi
+
     log_info "Hermes version after update: $new_version"
 
-    if ! run_hermes doctor >>"$LOG_FILE" 2>&1; then
+    # `hermes doctor` can block on network probes — bound it.
+    if ! run_hermes_with_timeout doctor >>"$LOG_FILE" 2>&1; then
         add_warning "Hermes" "hermes doctor reported problems after update"
+    fi
+
+    # Verify the gateway actually survived the update.
+    if ! gateway_is_running; then
+        log_warn "Gateway not running after update — restarting"
+        if ! restart_hermes_gateway; then
+            add_error "Hermes" "Gateway is not running after update and could not be restarted"
+        fi
     fi
 }
 
@@ -795,7 +972,7 @@ run_health_checks() {
 
     # Check Hermes gateway
     if [[ -x "$HERMES_CLI" ]]; then
-        if ! pgrep -f 'hermes.*gateway run' >/dev/null 2>&1; then
+        if ! gateway_is_running; then
             add_error "Health" "Hermes gateway is not running"
             log_error "Hermes gateway DOWN"
             failures=$((failures + 1))
@@ -835,6 +1012,51 @@ run_health_checks() {
     return $failures
 }
 
+# ─── Diagnostic finding classification ───────────────────────────────────────
+
+# Findings are split into two classes:
+#   actionable — a concrete defect a remediation command can fix
+#                (broken packages, failed units, dead containers, gateway down)
+#   advisory   — informational pressure signals that a model should not try
+#                to "fix" unattended (journal noise, memory, load, and any
+#                category listed in DIAGNOSTIC_ADVISORY)
+#
+# Only actionable findings trigger LLM remediation when
+# REMEDIATE_ON_ACTIONABLE_ONLY=true (the default). Advisory findings are
+# always recorded in the report and the notification summary.
+DIAG_ACTIONABLE=0
+DIAG_ADVISORY=0
+
+is_advisory_category() {
+    local category="$1" entry
+    for entry in $DIAGNOSTIC_ADVISORY; do
+        [[ "$entry" == "$category" ]] && return 0
+    done
+    return 1
+}
+
+# diag_finding <category> <error|warning> <message>
+diag_finding() {
+    local category="$1" level="$2"; shift 2
+    local msg="$*"
+
+    if is_advisory_category "$category"; then
+        DIAG_ADVISORY=$((DIAG_ADVISORY + 1))
+        add_warning "Advisory" "$msg"
+        log_warn "Advisory finding (${category}): $msg"
+        return 0
+    fi
+
+    DIAG_ACTIONABLE=$((DIAG_ACTIONABLE + 1))
+    if [[ "$level" == "error" ]]; then
+        add_error "Diagnostic" "$msg"
+        log_error "$msg"
+    else
+        add_warning "Diagnostic" "$msg"
+        log_warn "$msg"
+    fi
+}
+
 # ─── Full Diagnostic ────────────────────────────────────────────────────────
 
 # Comprehensive post-update diagnostic. Goes beyond the basic health checks
@@ -860,6 +1082,8 @@ run_full_diagnostic() {
     {
         echo "=== Controlled System Update — Full Diagnostic ==="
         echo "Host: $HOSTNAME_LABEL"
+        echo "Platform: ${OS_ID} ${OS_VERSION_ID} (${OS_CODENAME}) ${HOST_ARCH}/${DPKG_ARCH}"
+        echo "apt: ${APT_MAJOR}.x   kernel: $(uname -r)"
         echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo ""
     } >> "$report"
@@ -872,8 +1096,7 @@ run_full_diagnostic() {
         echo "$dpkg_audit" >> "$report"
         echo "" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "dpkg audit found issues"
-        log_warn "dpkg audit found issues"
+        diag_finding dpkg warning "dpkg audit found issues"
     else
         echo "--- dpkg Audit: OK ---" >> "$report"
         echo "" >> "$report"
@@ -887,8 +1110,7 @@ run_full_diagnostic() {
         echo "$apt_check" >> "$report"
         echo "" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "apt-get check found broken dependencies"
-        log_warn "apt-get check found broken dependencies"
+        diag_finding apt error "apt-get check found broken dependencies"
     else
         echo "--- apt-get check: OK ---" >> "$report"
         echo "" >> "$report"
@@ -902,7 +1124,7 @@ run_full_diagnostic() {
         echo "$failed_units" >> "$report"
         echo "" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "Failed systemd units detected"
+        diag_finding systemd warning "Failed systemd units detected"
     else
         echo "--- systemd Failed Units: None ---" >> "$report"
         echo "" >> "$report"
@@ -917,7 +1139,7 @@ run_full_diagnostic() {
         echo "$journal_errors" >> "$report"
         echo "" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "Journal errors in last 30 minutes"
+        diag_finding journal warning "Journal errors in last 30 minutes"
     else
         echo "--- Journal Errors (last 30 min): None ---" >> "$report"
         echo "" >> "$report"
@@ -941,7 +1163,7 @@ run_full_diagnostic() {
             echo "$unhealthy" >> "$report"
             echo "" >> "$report"
             issues=$((issues + 1))
-            add_warning "Diagnostic" "Unhealthy Docker containers: $(echo "$unhealthy" | tr '\n' ' ')"
+            diag_finding docker warning "Unhealthy Docker containers: $(echo "$unhealthy" | tr '\n' ' ')"
         fi
 
         # Check for exited containers that should be running
@@ -953,7 +1175,7 @@ run_full_diagnostic() {
             echo "$exited" >> "$report"
             echo "" >> "$report"
             issues=$((issues + 1))
-            add_warning "Diagnostic" "Exited/dead Docker containers detected"
+            diag_finding docker warning "Exited/dead Docker containers detected"
         fi
     else
         echo "--- Docker: Not installed ---" >> "$report"
@@ -962,23 +1184,22 @@ run_full_diagnostic() {
 
     # 6. Hermes gateway + doctor
     if [[ -x "$HERMES_CLI" ]]; then
-        if pgrep -f 'hermes.*gateway run' >/dev/null 2>&1; then
+        if gateway_is_running; then
             echo "--- Hermes Gateway: Running ---" >> "$report"
         else
             echo "--- Hermes Gateway: DOWN ---" >> "$report"
             issues=$((issues + 1))
-            add_error "Diagnostic" "Hermes gateway is DOWN"
-            log_error "Hermes gateway DOWN (diagnostic)"
+            diag_finding hermes error "Hermes gateway is DOWN"
         fi
 
         local hermes_doctor
-        hermes_doctor="$(run_hermes doctor 2>&1 || true)"
+        hermes_doctor="$(run_hermes_with_timeout doctor 2>&1 || true)"
         echo "--- Hermes Doctor ---" >> "$report"
         echo "$hermes_doctor" >> "$report"
         echo "" >> "$report"
         if echo "$hermes_doctor" | grep -qiE 'fail|error|not found|missing'; then
             issues=$((issues + 1))
-            add_warning "Diagnostic" "Hermes doctor reported problems"
+            diag_finding hermes warning "Hermes doctor reported problems"
         fi
     else
         echo "--- Hermes: CLI not found ---" >> "$report"
@@ -993,10 +1214,10 @@ run_full_diagnostic() {
     root_usage="$(df -h / | awk 'NR==2 {print $5}' | tr -d '%')"
     if [[ -n "$root_usage" ]] && (( root_usage > 90 )); then
         issues=$((issues + 1))
-        add_error "Diagnostic" "Disk usage critical: ${root_usage}% on /"
+        diag_finding disk error "Disk usage critical: ${root_usage}% on /"
     elif [[ -n "$root_usage" ]] && (( root_usage > 80 )); then
         issues=$((issues + 1))
-        add_warning "Diagnostic" "Disk usage high: ${root_usage}% on /"
+        diag_finding disk warning "Disk usage high: ${root_usage}% on /"
     fi
 
     # 8. Memory
@@ -1007,7 +1228,7 @@ run_full_diagnostic() {
     mem_avail="$(free -m | awk '/^Mem:/ {print $7}')"
     if [[ -n "$mem_avail" ]] && (( mem_avail < 256 )); then
         issues=$((issues + 1))
-        add_warning "Diagnostic" "Low available memory: ${mem_avail}MB"
+        diag_finding memory warning "Low available memory: ${mem_avail}MB"
     fi
 
     # 9. Network: default gateway reachability
@@ -1020,12 +1241,12 @@ run_full_diagnostic() {
         else
             echo "Gateway reachable: NO" >> "$report"
             issues=$((issues + 1))
-            add_warning "Diagnostic" "Default gateway ($default_gw) unreachable"
+            diag_finding network warning "Default gateway ($default_gw) unreachable"
         fi
     else
         echo "--- Network: No default gateway ---" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "No default gateway found"
+        diag_finding network warning "No default gateway found"
     fi
     echo "" >> "$report"
 
@@ -1037,7 +1258,7 @@ run_full_diagnostic() {
     else
         echo "DNS resolution: FAILED" >> "$report"
         issues=$((issues + 1))
-        add_warning "Diagnostic" "DNS resolution failed"
+        diag_finding dns warning "DNS resolution failed"
     fi
     echo "" >> "$report"
 
@@ -1057,8 +1278,13 @@ run_full_diagnostic() {
     echo "" >> "$report"
 
     # Summary
-    echo "=== Diagnostic Summary: $issues issue(s) found ===" >> "$report"
-    log_info "Full diagnostic complete: $issues issue(s) found"
+    {
+        echo "=== Diagnostic Summary ==="
+        echo "Total findings:      $issues"
+        echo "Actionable findings: $DIAG_ACTIONABLE"
+        echo "Advisory findings:   $DIAG_ADVISORY"
+    } >> "$report"
+    log_info "Full diagnostic complete: $issues finding(s) — ${DIAG_ACTIONABLE} actionable, ${DIAG_ADVISORY} advisory"
     log_info "Diagnostic report: $report"
 
     if (( issues > 0 )); then
@@ -1069,13 +1295,19 @@ run_full_diagnostic() {
 
 # ─── LLM Auto-Remediation ────────────────────────────────────────────────────
 
-# Safety check: block commands that could destroy data or make the system
-# unbootable. Returns 0 (safe) or 1 (blocked).
+# Safety check for an LLM-suggested remediation command.
 #
-# The blocklist is intentionally conservative — it blocks commands that are
-# destructive and irreversible. Commands like `apt-get install -f` (fix broken
-# deps), `systemctl restart`, `docker restart`, `docker compose up -d`,
-# `hermes gateway run --replace`, `dpkg --configure -a` are all allowed.
+# Two gates, in order:
+#   1. ALLOWLIST — the command's leading verb must match a known-safe
+#      remediation form. Anything unrecognised is rejected. An allowlist is
+#      the only defensible posture for shell text produced by a model.
+#   2. BLOCKLIST — destructive, long-running or unbootable-making patterns
+#      are rejected even if the leading verb looked acceptable.
+#
+# Shell metacharacters that chain or redirect (; | & ` $( ) > <) are rejected
+# outright: they let a single "allowed" verb smuggle arbitrary commands.
+#
+# Returns 0 (safe) or 1 (blocked).
 is_command_safe() {
     local cmd="$1"
 
@@ -1084,8 +1316,54 @@ is_command_safe() {
         return 1
     fi
 
-    # Blocklist — patterns that must never run automatically
-    # Each pattern is matched case-insensitively against the full command
+    # Reject anything that is not a plain single command invocation.
+    # No chaining, piping, substitution, redirection or backgrounding.
+    if [[ "$cmd" =~ [\;\|\&\`\<\>] || "$cmd" == *'$('* || "$cmd" == *'${'* ]]; then
+        log_warn "Blocked command with shell metacharacters: $cmd"
+        return 1
+    fi
+
+    # Reject log lines and other non-command text (defence in depth against
+    # the 2026-09-16 class of bug where log output was parsed as a command).
+    if [[ "$cmd" =~ ^\[[0-9]{4}- ]]; then
+        log_warn "Blocked non-command text: $cmd"
+        return 1
+    fi
+
+    # Gate 1 — allowlist of remediation forms
+    local allowlist=(
+        '^systemctl[[:space:]]+(restart|start|reload|reset-failed)[[:space:]]+[A-Za-z0-9@_.:\\-]+$'
+        '^systemctl[[:space:]]+--user[[:space:]]+(restart|start|reload|reset-failed)[[:space:]]+[A-Za-z0-9@_.:\\-]+$'
+        '^systemctl[[:space:]]+daemon-reload$'
+        '^docker[[:space:]]+(restart|start)[[:space:]]+[A-Za-z0-9_.\\-]+$'
+        '^docker[[:space:]]+compose([[:space:]]+-f[[:space:]]+[^[:space:]]+)?[[:space:]]+up[[:space:]]+-d([[:space:]]+[A-Za-z0-9_.\\-]+)*$'
+        '^docker[[:space:]]+(image[[:space:]]+)?prune[[:space:]]+-f$'
+        '^docker[[:space:]]+system[[:space:]]+prune[[:space:]]+-f$'
+        '^apt-get[[:space:]]+(install[[:space:]]+-f|check|update|autoclean)([[:space:]]+-y)?$'
+        '^apt-get[[:space:]]+-y[[:space:]]+install[[:space:]]+-f$'
+        '^dpkg[[:space:]]+--configure[[:space:]]+-a$'
+        '^journalctl[[:space:]]+--vacuum-(size|time)=[A-Za-z0-9]+$'
+        '^hermes[[:space:]]+gateway[[:space:]]+(restart|status)$'
+        '^hermes[[:space:]]+doctor$'
+        '^needrestart[[:space:]]+-r[[:space:]]+a$'
+        '^snap[[:space:]]+refresh$'
+    )
+
+    local allowed=false
+    local allow_pattern
+    for allow_pattern in "${allowlist[@]}"; do
+        if echo "$cmd" | grep -qE "$allow_pattern"; then
+            allowed=true
+            break
+        fi
+    done
+
+    if [[ "$allowed" != "true" ]]; then
+        log_warn "Blocked command not on the remediation allowlist: $cmd"
+        return 1
+    fi
+
+    # Gate 2 — blocklist, applied even to allowlisted verbs
     local blocklist=(
         'rm[[:space:]]+-rf[[:space:]]+/'
         'rm[[:space:]]+-rf[[:space:]]+/\*'
@@ -1123,6 +1401,21 @@ is_command_safe() {
         'dpkg[[:space:]]+--purge'
         'pip[[:space:]]+uninstall'
         'npm[[:space:]]+uninstall'
+        # Never-ending commands: these block the update service until
+        # TimeoutStartSec kills it. Root cause of the 2026-09-16 timeout
+        # failure, where the LLM suggested `hermes gateway run --replace`
+        # and the foreground gateway ran until systemd terminated the unit.
+        # `hermes gateway restart` is the correct, bounded alternative and
+        # is on the allowlist.
+        'hermes[[:space:]]+gateway[[:space:]]+run'
+        'hermes[[:space:]]+serve'
+        'hermes[[:space:]]+dashboard'
+        'tail[[:space:]]+-f'
+        'journalctl[[:space:]]+-f'
+        'docker[[:space:]]+logs[[:space:]]+-f'
+        'docker[[:space:]]+(attach|exec[[:space:]]+-it)'
+        'watch[[:space:]]'
+        'sleep[[:space:]]+[0-9]{3,}'
     )
 
     local pattern
@@ -1184,11 +1477,30 @@ llm_get_remediation() {
     system_prompt="You are a Linux SRE diagnostic assistant. You receive a system diagnostic report after an automatic update. Your job is to identify issues and suggest remediation commands. Rules:
 1. Only suggest shell commands that fix the identified issues.
 2. Each command must be on its own line, prefixed with 'CMD: '.
-3. Only suggest safe, non-destructive commands (no rm -rf, mkfs, dd, shutdown, reboot, purge, etc.).
-4. Prefer: systemctl restart <unit>, docker restart <container>, docker compose up -d, apt-get install -f, dpkg --configure -a, hermes gateway run --replace, hermes doctor, etc.
-5. If no remediation is needed, output 'NO_REMEDIATION_NEEDED'.
-6. Do not suggest interactive commands.
-7. Maximum 10 commands."
+3. Every command must be a single, plain, non-interactive invocation that
+   terminates on its own. No pipes, no ';', no '&&', no redirection, no
+   command substitution, no backgrounding.
+4. Commands are accepted only from this allowlist:
+   systemctl restart|start|reload|reset-failed <unit>
+   systemctl --user restart|start|reload|reset-failed <unit>
+   systemctl daemon-reload
+   docker restart|start <container>
+   docker compose up -d
+   docker image prune -f / docker system prune -f
+   apt-get install -f -y / apt-get check / apt-get update / apt-get autoclean
+   dpkg --configure -a
+   journalctl --vacuum-size=<size> / journalctl --vacuum-time=<time>
+   hermes gateway restart / hermes gateway status / hermes doctor
+   needrestart -r a
+   snap refresh
+   Anything else is rejected automatically, so do not suggest it.
+5. NEVER suggest a long-running or foreground command (hermes gateway run,
+   hermes serve, tail -f, journalctl -f, watch, sleep). They hang the
+   update service until systemd kills it. Use 'hermes gateway restart'.
+6. Never suggest destructive commands (rm -rf, mkfs, dd, shutdown, reboot,
+   apt remove/purge, systemctl disable/mask).
+7. If no remediation is needed, output 'NO_REMEDIATION_NEEDED'.
+8. Maximum 10 commands."
 
     local user_prompt
     user_prompt="Diagnostic report:\n\n${report_content}\n\nSuggest remediation commands:"
@@ -1289,6 +1601,10 @@ run_diagnostic_and_remediate() {
     while (( attempt < max_attempts )); do
         attempt=$((attempt + 1))
 
+        # Reset per-round classification counters
+        DIAG_ACTIONABLE=0
+        DIAG_ADVISORY=0
+
         # Run diagnostic
         if run_full_diagnostic; then
             log_info "Diagnostic passed — no issues found (attempt $attempt)"
@@ -1296,7 +1612,15 @@ run_diagnostic_and_remediate() {
         fi
 
         # Issues found
-        log_warn "Diagnostic found issues (attempt $attempt/$max_attempts)"
+        log_warn "Diagnostic found $DIAG_ACTIONABLE actionable / $DIAG_ADVISORY advisory finding(s) (attempt $attempt/$max_attempts)"
+
+        # Advisory-only findings are reported but never auto-remediated:
+        # a disk at 85% or journal noise is a human decision, and asking a
+        # model to "fix" it produces churn, not repair.
+        if [[ "$REMEDIATE_ON_ACTIONABLE_ONLY" == "true" ]] && (( DIAG_ACTIONABLE == 0 )); then
+            log_info "Only advisory findings present — skipping LLM remediation"
+            return 0
+        fi
 
         if [[ "$LLM_REMEDIATION_ENABLED" != "true" ]]; then
             log_warn "LLM remediation is disabled — issues left unresolved"
@@ -1343,12 +1667,25 @@ run_diagnostic_and_remediate() {
             fi
 
             log_info "Executing remediation command: $cmd"
-            if eval "$cmd" >>"$LOG_FILE" 2>&1; then
+            # No eval: commands are single plain invocations (metacharacters
+            # are rejected by is_command_safe), so word-splitting via an
+            # array is both sufficient and safer. A hard timeout guarantees
+            # a misbehaving command cannot hang the systemd unit.
+            local -a cmd_argv
+            read -r -a cmd_argv <<<"$cmd"
+            if timeout --signal=TERM --kill-after=15s \
+                "$REMEDIATION_CMD_TIMEOUT" "${cmd_argv[@]}" >>"$LOG_FILE" 2>&1; then
                 log_info "Remediation command succeeded: $cmd"
                 executed=$((executed + 1))
             else
-                log_warn "Remediation command failed: $cmd"
-                add_warning "LLM Remediation" "Command failed: $cmd"
+                local rc=$?
+                if (( rc == 124 || rc == 137 )); then
+                    log_warn "Remediation command timed out after ${REMEDIATION_CMD_TIMEOUT}s: $cmd"
+                    add_warning "LLM Remediation" "Command timed out: $cmd"
+                else
+                    log_warn "Remediation command failed (exit $rc): $cmd"
+                    add_warning "LLM Remediation" "Command failed: $cmd"
+                fi
             fi
         done <<< "$remediation_cmds"
 
@@ -1412,7 +1749,14 @@ main() {
     log_info "========================================"
     log_info "Controlled System Update - $(date)"
     log_info "Host: $HOSTNAME_LABEL"
+    log_info "Platform: ${OS_ID} ${OS_VERSION_ID} (${OS_CODENAME}) ${HOST_ARCH}/${DPKG_ARCH}, apt ${APT_MAJOR}.x, kernel $(uname -r)"
     log_info "========================================"
+
+    if ! command -v apt-get &>/dev/null; then
+        log_error "apt-get not found — this script supports Debian/Ubuntu only"
+        notify_telegram "<b>[$HOSTNAME_LABEL] System Update ABORTED</b>\napt-get not found; Debian/Ubuntu required."
+        exit 1
+    fi
 
     acquire_lock
 
@@ -1451,10 +1795,14 @@ main() {
     # Schedule reboot only after all updates and health checks are done
     schedule_reboot_if_required
 
+    local header
+    header="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    header+="\nPlatform: ${OS_ID} ${OS_VERSION_ID} ${DPKG_ARCH}"
+
     if $has_errors; then
         local message
         message="<b>[$HOSTNAME_LABEL] System Update FAILED</b>"
-        message+="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        message+="$header"
         message+="\n"
         message+="$ERRORS"
         if $has_warnings; then
@@ -1466,19 +1814,31 @@ main() {
         notify_telegram "$message"
         exit 1
     elif $has_warnings; then
-        # Warnings only — still notify so user is aware
+        if [[ "$NOTIFY_LEVEL" == "error" ]]; then
+            log_info "Update completed with warnings - suppressed (NOTIFY_LEVEL=error)"
+            exit 0
+        fi
         local message
         message="<b>[$HOSTNAME_LABEL] System Update Completed with Warnings</b>"
-        message+="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        message+="$header"
         message+="$WARNINGS"
         message+="\n\nLog: $LOG_FILE"
         log_warn "Update completed with warnings - sending Telegram notification"
         notify_telegram "$message"
         exit 0
     else
-        log_info "Update completed successfully - no notification sent (silent on success)"
+        if [[ "$NOTIFY_LEVEL" == "always" ]]; then
+            notify_telegram "<b>[$HOSTNAME_LABEL] System Update OK</b>${header}\n\nNo issues found."
+        fi
+        log_info "Update completed successfully - no issues"
         exit 0
     fi
 }
 
-main "$@"
+
+# Sourcing guard: `CSU_SOURCE_ONLY=1 source scripts/auto-update.sh` loads every
+# function for unit testing without performing an update. Production paths are
+# unaffected — the variable is never set by the systemd unit or the installer.
+if [[ -z "${CSU_SOURCE_ONLY:-}" ]]; then
+    main "$@"
+fi

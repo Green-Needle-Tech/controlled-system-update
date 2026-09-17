@@ -2,9 +2,25 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
-**v2.6.0** — Full post-update diagnostic + LLM auto-remediation: after all update phases, a comprehensive diagnostic (dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg, Hermes doctor) runs automatically. If issues are found, the report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands — each safety-checked against a blocklist before execution. The cycle repeats up to 3 times.
+**v3.0.0** — Incident-driven hardening. Remediation is now **allowlist-gated** (a command must match a known-safe form before the blocklist is even consulted), `eval` is gone, shell metacharacters are rejected, and every command has a hard timeout. Adds **Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support, and splits diagnostic findings into *actionable* vs *advisory* so journal noise no longer triggers nightly remediation churn. See [CHANGELOG](CHANGELOG.md#300---2026-09-17) for the two production root causes this release fixes.
+
+**v2.6.0** — Full post-update diagnostic + LLM auto-remediation: after all update phases, a comprehensive diagnostic (dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg, Hermes doctor) runs automatically.
 
 **v2.5.0** — Host-portable: Hermes paths (CLI, user home, HERMES_HOME) auto-detected at runtime, and all hermes commands run as the repo-owning user via `runuser` — fixes git's "dubious ownership" error when the systemd service runs as root but Hermes is installed for a regular user (e.g. /home/ubuntu).
+
+## Supported Platforms
+
+| Platform | Status |
+|---|---|
+| Ubuntu 26.04 LTS (Resolute Raccoon), apt 3.x | supported |
+| Ubuntu 24.04 LTS (Noble), apt 2.x | supported (reference host) |
+| Ubuntu 22.04 LTS (Jammy) | supported |
+| Debian 12+ | expected to work |
+| amd64 / x86_64 | supported |
+| arm64 / aarch64 | supported |
+| armhf | best effort |
+
+OS, architecture and apt generation are detected at runtime — there is nothing to configure. Package operations always use `apt-get`, the stable scripting interface across both apt 2.x and apt 3.x. No GNU-coreutils-specific behaviour is relied upon (Ubuntu 25.10+ ships Rust uutils coreutils). Docker pulls are pinned to the host architecture so mixed amd64/arm64 fleets cannot silently acquire an emulated image from an incomplete manifest list.
 
 ## What It Updates
 
@@ -64,7 +80,7 @@ Reinstalling preserves your existing configuration — the new template is insta
 
 ### Requirements
 
-- Ubuntu/Debian host with `apt`
+- Ubuntu/Debian host with `apt-get` (Ubuntu 22.04 → 26.04 LTS, amd64 or arm64)
 - `curl` (for Telegram API)
 - Docker (optional — skipped if not installed)
 - Hermes Agent (optional — skipped if CLI not found)
@@ -130,6 +146,19 @@ LLM_MODEL="z-ai/glm-5.2"
 # LLM_API_KEY=""  # auto-detected from ~/.hermes/.env
 LLM_TIMEOUT="120"
 LLM_MAX_REMEDIATION_ATTEMPTS="3"
+
+# Hard timeout per remediation command (seconds)
+REMEDIATION_CMD_TIMEOUT="120"
+
+# Only remediate actionable findings; advisory ones are reported only
+REMEDIATE_ON_ACTIONABLE_ONLY="true"
+DIAGNOSTIC_ADVISORY="journal memory load"
+
+# Notification volume: error | warning | always
+NOTIFY_LEVEL="warning"
+
+# Take Ubuntu phased updates immediately (keeps a fleet uniform)
+INCLUDE_PHASED_UPDATES="false"
 ```
 
 ## Full Diagnostic + LLM Auto-Remediation
@@ -146,7 +175,36 @@ After all update phases and basic health checks, the script runs a comprehensive
 - **Network** — default gateway reachability + DNS resolution
 - **dmesg errors** — filesystem/hardware errors
 
-If issues are found and `LLM_REMEDIATION_ENABLED=true`, the diagnostic report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands. Each command is safety-checked against a blocklist (no `rm -rf /`, `mkfs`, `dd`, `shutdown`, `reboot`, `purge`, `curl | sh`, etc.) before execution. The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times.
+### Actionable vs advisory findings
+
+Findings are classified before anything is remediated:
+
+- **Actionable** — broken packages, failed units, dead/unhealthy containers, gateway down. These can be fixed by a command, so they are eligible for remediation.
+- **Advisory** — journal noise, memory pressure, load average (configurable via `DIAGNOSTIC_ADVISORY`). These are reported in the log, the report and the notification, but are **never** handed to the model. A disk at 85% is a human decision, not something to "fix" unattended at 04:00.
+
+With `REMEDIATE_ON_ACTIONABLE_ONLY="true"` (default), a run with only advisory findings skips remediation entirely.
+
+### How remediation is gated
+
+If actionable issues are found and `LLM_REMEDIATION_ENABLED=true`, the report is sent to an LLM which suggests remediation commands. Each suggestion passes through two gates before it can run:
+
+1. **Allowlist (gate 1)** — the command must match a known-safe remediation form:
+   `systemctl restart|start|reload|reset-failed <unit>`, `systemctl daemon-reload`,
+   `docker restart|start <container>`, `docker compose up -d`, `docker image|system prune -f`,
+   `apt-get install -f` / `check` / `update` / `autoclean`, `dpkg --configure -a`,
+   `journalctl --vacuum-size=|--vacuum-time=`, `hermes gateway restart|status`,
+   `hermes doctor`, `needrestart -r a`, `snap refresh`.
+   Anything unrecognised is rejected. A blocklist alone cannot be sound against free-form text produced by a model.
+2. **Blocklist (gate 2)** — destructive patterns (`rm -rf /`, `mkfs`, `dd of=/dev/`, `shutdown`, `reboot`, `apt purge`, `systemctl disable|mask`, `curl | sh`, fork bombs) **and never-ending commands** (`hermes gateway run`, `hermes serve`, `tail -f`, `journalctl -f`, `watch`, `sleep 1000`) are rejected even if gate 1 passed.
+
+Additionally:
+
+- Shell metacharacters (`;` `|` `&` `` ` `` `$(` `>` `<`) are rejected outright, so an allowed verb cannot smuggle a second command (`systemctl restart nginx; rm -rf /var`).
+- Commands are executed **without `eval`**, as an argv array.
+- Each command runs under a hard `REMEDIATION_CMD_TIMEOUT`, so one hung command cannot consume the systemd unit's whole time budget.
+- Text that looks like a log line is rejected as a command.
+
+The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times. These gates are covered by 44 assertions in `tests/safety-gate-test.sh`, run in CI.
 
 The LLM API key is auto-detected from `~/.hermes/.env` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`). The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
 
@@ -188,11 +246,15 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 
 ## Notification Behavior
 
-| Outcome | Telegram |
-|---------|----------|
-| Success (no issues) | Silent — no message |
-| Warnings (non-fatal) | Message with warning details |
-| Errors (failures) | Message with error details + log path |
+Controlled by `NOTIFY_LEVEL`:
+
+| Outcome | `error` | `warning` (default) | `always` |
+|---------|---------|---------------------|----------|
+| Success (no issues) | silent | silent | summary sent |
+| Warnings (non-fatal) | silent | message with details | message with details |
+| Errors (failures) | message + log path | message + log path | message + log path |
+
+Every message carries the host label, timestamp and platform (OS, version, architecture).
 
 ## Safety Features
 
@@ -203,7 +265,10 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 - **Config security** — secrets are not exported to child processes; ownership and permissions validated before sourcing
 - **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
 - **Memory limit** — 1G cap on systemd service
-- **Umask=0077** — restricts file creation permissions on systemd service
+- **UMask=0077** — restricts file creation permissions on the systemd service (note: `Umask=` is *not* a systemd directive and is silently ignored; CI rejects the typo)
+- **Allowlist-gated remediation** — see above; no `eval`, no metacharacters, per-command timeout
+- **Precise gateway detection** — matches the real interpreter invocation and systemd unit state, not any process whose command line merely mentions "hermes gateway run"
+- **Partial-update recovery** — a `hermes update` that pulls successfully but fails its own gateway relaunch is recovered with a bounded `hermes gateway restart` rather than failing the run
 - **Deferred reboot** — reboot scheduling occurs only after all update and verification phases
 - **needrestart** — automatically restarts services after library upgrades (if installed)
 - **Log rotation** — auto-deletes log files older than 30 days (configurable)
@@ -213,19 +278,21 @@ The full SRE procedure is documented in [SKILL.md](SKILL.md).
 - **External-skill-safe** — `hermes skills check` by default; never uses `--force` (locally modified skills preserved); covers all provenance-tracked GitHub, URL, tap, and hub-installed skills
 - **Docker-safe** — groups containers by Compose project, uses Compose labels, official Docker Hub images not misclassified as local
 - **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
-- **CI** — ShellCheck linting via GitHub Actions on every push (pinned action)
+- **CI** — ShellCheck linting, safety-gate unit tests, a syntax matrix across `ubuntu-24.04` / `ubuntu-24.04-arm` / `ubuntu-latest`, and systemd unit-file validation on every push
 
 ## File Structure
 
 ```
 controlled-system-update/
-├── .github/workflows/lint.yml         # ShellCheck CI (pinned action)
+├── .github/workflows/lint.yml         # ShellCheck + safety gate + arch matrix + unit checks
 ├── CHANGELOG.md                       # Version history
 ├── SKILL.md                           # Full SRE procedure + auto-mode docs
 ├── README.md                          # This file
 ├── LICENSE                            # MIT
 ├── install.sh                         # One-command installer (preserves config)
 ├── e2e-test.sh                        # End-to-end test suite (non-destructive by default)
+├── tests/
+│   └── safety-gate-test.sh            # Unit tests for the remediation safety gate
 ├── scripts/
 │   └── auto-update.sh                 # Main automatic update script
 ├── config/

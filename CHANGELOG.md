@@ -3,6 +3,111 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [3.0.0] - 2026-09-17
+
+Incident-driven hardening release. On 2026-09-16 a production run was killed
+by `TimeoutStartSec` after the LLM remediation loop executed its own log
+output as shell commands and then ran `hermes gateway run --replace` in the
+foreground. Both faults, and the class of faults behind them, are fixed here.
+Also adds Ubuntu 26.04 LTS (Resolute Raccoon) and arm64 support.
+
+### Fixed
+- **Log lines were executed as remediation commands.** `log()` wrote to
+  stdout, and `llm_get_remediation()` returns its command list on stdout via
+  command substitution, so every `[INFO] …` line emitted inside that function
+  was spliced into the command list and run. All logging now goes to stderr;
+  only data goes to stdout. (Root cause, 2026-09-16.)
+- **`hermes gateway run --replace` hung the systemd unit.** The command runs
+  a gateway in the foreground and never returns, so the update service ran
+  until systemd terminated it 55 minutes later. Foreground/never-ending
+  commands are now blocklisted, and `hermes gateway restart` (bounded) is the
+  supported remediation. (Root cause, 2026-09-16.)
+- **`Umask=0077` in the systemd unit was silently ignored** — the correct
+  directive is `UMask=` (capital M). systemd logged
+  `Unknown key name 'Umask'` on every daemon-reload and the unit ran with the
+  default umask. CI now fails on the typo.
+- **Gateway detection produced false positives.** `pgrep -f
+  'hermes.*gateway run'` matched any process whose command line merely
+  mentioned those words — an admin's grep, this script's own subshell, an
+  agent session. On the reference host the old pattern matched 3 processes
+  where 1 gateway was running. Replaced with `gateway_is_running()`, which
+  matches the real interpreter invocation and accepts the systemd unit state.
+- **A partially failed `hermes update` aborted the phase** even when the new
+  code had been pulled and installed successfully and only the updater's own
+  gateway relaunch had crashed (e.g. `ImportError` from mixed `sys.modules`).
+  This exact failure occurred on 2026-09-16. The script now attempts a
+  bounded `hermes gateway restart` and reports a recovered warning instead of
+  a hard error.
+- `hermes doctor` is now run under a timeout in both the update and
+  diagnostic phases; it could previously block on network probes.
+
+### Security
+- **Remediation is now allowlist-gated, not blocklist-only.** A command must
+  match a known-safe remediation form (`systemctl restart <unit>`, `docker
+  restart <container>`, `apt-get install -f`, `dpkg --configure -a`,
+  `journalctl --vacuum-*`, `hermes gateway restart`, …) before the blocklist
+  is even consulted. A blocklist alone cannot be sound against free-form text
+  produced by a model.
+- **Shell metacharacters are rejected outright** (`;` `|` `&` `` ` `` `$(` `>` `<`).
+  Previously an allowed verb could smuggle arbitrary commands, e.g.
+  `systemctl restart nginx; rm -rf /var`.
+- **`eval` removed** from the remediation path. Commands are split into an
+  argv array and executed directly.
+- **Per-command hard timeout** (`REMEDIATION_CMD_TIMEOUT`, default 120s), so
+  no single command can consume the unit's whole time budget again.
+- Text that looks like a log line is rejected as a command (defence in depth
+  against the root cause above).
+- New `tests/safety-gate-test.sh`: 44 assertions covering both incident
+  regressions, metacharacter smuggling, destructive commands and
+  never-ending commands. Wired into CI.
+
+### Added
+- **Ubuntu 26.04 LTS (Resolute Raccoon) support.** Runtime detection of OS
+  ID/version/codename, `uname -m`, `dpkg --print-architecture` and the apt
+  major generation. All package operations continue to use `apt-get`, which
+  is the stable scripting interface across apt 2.x and apt 3.x.
+- **arm64/amd64 portability.** Docker pulls are pinned to the host
+  architecture (`--platform linux/arm64` / `linux/amd64` / `linux/arm/v7`),
+  so mixed fleets cannot silently acquire an emulated image from an
+  incomplete manifest list. No GNU-coreutils-only behaviour is relied upon
+  (Ubuntu 25.10+ ships Rust uutils coreutils).
+- **apt 3.x rollback guidance**: on a failed upgrade on Ubuntu 26.04+, the
+  error output and Telegram message point at `apt history-info 0` /
+  `sudo apt history-undo 0`.
+- **Actionable vs advisory diagnostic findings.** Journal noise, memory
+  pressure and load average no longer trigger the LLM remediation loop; they
+  are reported only. Controlled by `DIAGNOSTIC_ADVISORY` (default:
+  `journal memory load`) and `REMEDIATE_ON_ACTIONABLE_ONLY` (default: true).
+  This stops nightly remediation churn on a healthy-but-busy host.
+- `NOTIFY_LEVEL` (`error` | `warning` | `always`) to control Telegram volume.
+- `INCLUDE_PHASED_UPDATES` to opt into Ubuntu phased updates fleet-wide.
+- Reboot detection checks `/run/reboot-required` as well as
+  `/var/run/reboot-required`, and logs the packages requiring the reboot.
+- Platform line (OS, codename, arch, apt generation, kernel) in the startup
+  log, the diagnostic report header and every Telegram notification.
+- Preflight abort with a clear message when `apt-get` is absent.
+- `CSU_SOURCE_ONLY=1` sourcing guard so the script's functions can be unit
+  tested without running an update.
+- CI matrix: syntax + safety-gate tests on `ubuntu-24.04`,
+  `ubuntu-24.04-arm` and `ubuntu-latest`; a systemd unit-file job that
+  rejects silently-ignored directives.
+
+### Changed
+- `TimeoutStartSec` raised from 3600 to 5400 seconds. A full run includes
+  `hermes update`, which rebuilds the web UI; on slower arm64 hosts that plus
+  a large image pull crowded the old one-hour budget. Every inner phase keeps
+  its own tighter timeout, so this is only a backstop.
+- The LLM system prompt now states the allowlist explicitly and forbids
+  foreground commands, so rejected suggestions are rare rather than routine.
+
+### Upgrade notes
+- Re-run `sudo bash install.sh`. Existing configuration is preserved and the
+  new template lands as `auto-update.conf.dist`.
+- `systemctl daemon-reload` is required for the `UMask` and
+  `TimeoutStartSec` changes to take effect.
+- Behaviour change: advisory-only findings no longer trigger remediation.
+  Set `REMEDIATE_ON_ACTIONABLE_ONLY="false"` to restore 2.x behaviour.
+
 ## [2.6.0] - 2026-09-05
 
 ### Added

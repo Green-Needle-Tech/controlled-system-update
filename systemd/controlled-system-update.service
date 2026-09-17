@@ -13,14 +13,20 @@ ExecStart=/usr/local/bin/auto-update.sh
 # Resource limits
 MemoryMax=1G
 CPUWeight=50
-# Timeout (1 hour)
-TimeoutStartSec=3600
+# Timeout (90 minutes).
+# A full run is OS + snap + Docker image pulls + `hermes update` (which
+# rebuilds the web UI) + diagnostics. On slower arm64 hosts the Node/Vite
+# build alone can eat a large share of the old 1h budget. Every inner phase
+# has its own tighter timeout, so this is a backstop only.
+TimeoutStartSec=5400
 # Nice level (lower priority — don't starve production services)
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-# Restrict file creation permissions
-Umask=0077
+# Restrict file creation permissions.
+# NOTE: the key is UMask (capital M). `Umask` is silently ignored and logs
+# "Unknown key name 'Umask' in section 'Service'" on every daemon-reload.
+UMask=0077
 # Logging
 StandardOutput=journal
 StandardError=journal

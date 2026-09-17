@@ -14,4 +14,53 @@ jobs:
         uses: ludeeus/action-shellcheck@1.1.0
         with:
           severity: warning
-          additional_files: scripts/auto-update.sh e2e-test.sh install.sh
+          additional_files: scripts/auto-update.sh e2e-test.sh install.sh tests/safety-gate-test.sh
+
+  safety-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit-test the remediation safety gate
+        run: bash tests/safety-gate-test.sh
+
+  syntax-matrix:
+    # The script must parse and gate correctly on every supported Ubuntu LTS,
+    # on both amd64 and arm64.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report platform
+        run: |
+          . /etc/os-release
+          echo "OS: $PRETTY_NAME  arch: $(dpkg --print-architecture)"
+          apt-get --version | head -1
+      - name: Bash syntax check
+        run: |
+          bash -n scripts/auto-update.sh
+          bash -n install.sh
+          bash -n e2e-test.sh
+          bash -n tests/safety-gate-test.sh
+      - name: Safety gate on this platform
+        run: bash tests/safety-gate-test.sh
+
+  systemd-units:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject silently-ignored directives
+        run: |
+          # systemd ignores unknown keys with only a journal warning, so a
+          # typo like `Umask=` (correct: `UMask=`) disables the setting
+          # without failing anything. Catch it in CI instead.
+          if grep -qE '^[[:space:]]*Umask=' systemd/controlled-system-update.service; then
+            echo "ERROR: 'Umask=' is not a systemd directive; use 'UMask='"
+            exit 1
+          fi
+      - name: Verify unit files
+        run: |
+          systemd-analyze verify systemd/controlled-system-update.service || true
+          systemd-analyze verify systemd/controlled-system-update.timer || true

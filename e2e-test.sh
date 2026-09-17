@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e-test.sh — End-to-end test for controlled-system-update v2.6.0
+# e2e-test.sh — End-to-end test for controlled-system-update v3.0.0
 # Tests: file layout, config, systemd units, script syntax, lock contention,
 # logging, health checks, diagnostic + LLM remediation, Telegram notification path
 #
@@ -22,8 +22,13 @@ SCRIPT_PATH="${SCRIPT_PATH:-/usr/local/bin/auto-update.sh}"
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 TEST_CONFIG="${TEST_CONFIG:-/tmp/csu-test-config.conf}"
 
+# Single source of truth for the expected version: the repo's own SKILL.md.
+# Hardcoding it here meant every release left a stale assertion behind.
+EXPECTED_VERSION="$(awk -F': *' '/^version:/ {print $2; exit}' "$REPO/SKILL.md" 2>/dev/null)"
+EXPECTED_VERSION="${EXPECTED_VERSION:-unknown}"
+
 echo "=========================================="
-echo "E2E Test: controlled-system-update v2.6.0"
+echo "E2E Test: controlled-system-update v${EXPECTED_VERSION}"
 echo "Host: $(hostname -s)"
 echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "=========================================="
@@ -93,10 +98,10 @@ done
 
 # SKILL.md version
 skill_version=$(grep '^version:' "$REPO/SKILL.md" | sed 's/version: *//' | tr -d '"')
-if [[ "$skill_version" == "2.6.0" ]]; then
-    pass "SKILL.md version is 2.6.0"
+if [[ "$skill_version" == "$EXPECTED_VERSION" ]]; then
+    pass "SKILL.md version is $EXPECTED_VERSION"
 else
-    fail "SKILL.md version is '$skill_version' (expected 2.6.0)"
+    fail "SKILL.md version is '$skill_version' (expected $EXPECTED_VERSION)"
 fi
 
 # ─── 3. Config Content ───────────────────────────────────────────────────────
@@ -239,7 +244,7 @@ else
     TG_CHAT="$TG_CHAT_ID"
 
     # Test 6a: Success message
-    test_msg="[E2E TEST] controlled-system-update v2.6.0 — test notification from $(hostname -s)"
+    test_msg="[E2E TEST] controlled-system-update v${EXPECTED_VERSION} — test notification from $(hostname -s)"
     http_code=$(curl -s -o /tmp/tg_test_response.json -w '%{http_code}' \
         -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT}" \
@@ -473,10 +478,10 @@ echo "--- 12. Local Skill Version ---"
 local_skill="${HERMES_HOME:-${HOME:-/root}/.hermes}/skills/devops/controlled-system-update/SKILL.md"
 if [[ -f "$local_skill" ]]; then
     local_skill_version=$(grep '^version:' "$local_skill" | sed 's/version: *//' | tr -d '"')
-    if [[ "$local_skill_version" == "2.6.0" ]]; then
-        pass "Local skill updated to v2.6.0"
+    if [[ "$local_skill_version" == "$EXPECTED_VERSION" ]]; then
+        pass "Local skill updated to v$EXPECTED_VERSION"
     else
-        warn "Local skill version is '$local_skill_version' (expected 2.6.0)"
+        warn "Local skill version is '$local_skill_version' (expected $EXPECTED_VERSION)"
     fi
 else
     warn "Local skill file missing at $local_skill (may not be installed on this host)"
@@ -569,11 +574,133 @@ else
     fail "README does not document diagnostic + LLM remediation feature"
 fi
 
-# Check CHANGELOG has v2.6.0 entry
-if grep -q '\[2.6.0\]' "$REPO/CHANGELOG.md" 2>/dev/null; then
-    pass "CHANGELOG has v2.6.0 entry"
+# Check CHANGELOG has an entry for the current version
+if grep -qF "[${EXPECTED_VERSION}]" "$REPO/CHANGELOG.md" 2>/dev/null; then
+    pass "CHANGELOG has v${EXPECTED_VERSION} entry"
 else
-    fail "CHANGELOG missing v2.6.0 entry"
+    fail "CHANGELOG missing v${EXPECTED_VERSION} entry"
+fi
+
+# ─── v3.0.0 regression checks ────────────────────────────────────────────────
+
+echo ""
+echo "--- v3.0.0: incident regressions and portability ---"
+
+SCRIPT_SRC="$REPO/scripts/auto-update.sh"
+
+# Regression 1 (2026-09-16): log output went to stdout and was captured by
+# command substitution, so log lines were executed as remediation commands.
+if grep -qE '^\s+echo "\[\$\{ts\}\] \[\$\{level\}\] \$\{msg\}" >&2' "$SCRIPT_SRC"; then
+    pass "log() writes to stderr (log lines cannot be captured as commands)"
+else
+    fail "log() does not write to stderr — log lines can be executed as commands"
+fi
+
+# Regression 2 (2026-09-16): `hermes gateway run --replace` ran in the
+# foreground until systemd's TimeoutStartSec killed the whole update.
+if grep -q "hermes\[\[:space:\]\]+gateway\[\[:space:\]\]+run" "$SCRIPT_SRC"; then
+    pass "Blocklist rejects foreground 'hermes gateway run'"
+else
+    fail "Blocklist does not reject 'hermes gateway run'"
+fi
+
+# Remediation must be allowlist-gated, not blocklist-only
+if grep -q 'Gate 1 — allowlist of remediation forms' "$SCRIPT_SRC"; then
+    pass "Remediation commands are allowlist-gated"
+else
+    fail "Remediation commands are not allowlist-gated"
+fi
+
+# No eval of model-produced text
+if grep -qE '^\s+if eval "\$cmd"' "$SCRIPT_SRC"; then
+    fail "Remediation still uses eval on LLM output"
+else
+    pass "Remediation does not eval LLM output"
+fi
+
+# Per-command timeout
+if grep -q 'REMEDIATION_CMD_TIMEOUT' "$SCRIPT_SRC"; then
+    pass "Per-command remediation timeout configured"
+else
+    fail "Per-command remediation timeout missing"
+fi
+
+# Precise gateway detection (the loose pgrep matched unrelated shells)
+if grep -q 'gateway_is_running()' "$SCRIPT_SRC"; then
+    pass "Precise gateway_is_running() helper present"
+else
+    fail "gateway_is_running() helper missing"
+fi
+# Match actual usage, not the comment that documents why the pattern is wrong.
+if grep -nE "^[^#]*pgrep[^#]*'hermes\.\*gateway run'" "$SCRIPT_SRC" >/dev/null; then
+    fail "Loose 'hermes.*gateway run' pgrep pattern still in use"
+else
+    pass "Loose gateway pgrep pattern removed"
+fi
+
+# Partial-update recovery
+if grep -q 'restart_hermes_gateway' "$SCRIPT_SRC"; then
+    pass "Hermes partial-update gateway recovery present"
+else
+    fail "Hermes partial-update gateway recovery missing"
+fi
+
+# Actionable vs advisory classification
+if grep -q 'diag_finding' "$SCRIPT_SRC" && grep -q 'REMEDIATE_ON_ACTIONABLE_ONLY' "$SCRIPT_SRC"; then
+    pass "Diagnostic findings classified actionable vs advisory"
+else
+    fail "Diagnostic finding classification missing"
+fi
+
+# Ubuntu 26.04 / multi-arch portability
+if grep -q 'DPKG_ARCH' "$SCRIPT_SRC" && grep -q 'APT_MAJOR' "$SCRIPT_SRC"; then
+    pass "Architecture and apt-generation detection present"
+else
+    fail "Architecture / apt-generation detection missing"
+fi
+
+if grep -q 'reboot_is_required()' "$SCRIPT_SRC" && grep -q '/run/reboot-required' "$SCRIPT_SRC"; then
+    pass "Reboot marker checks /run/reboot-required"
+else
+    fail "Reboot marker does not check /run/reboot-required"
+fi
+
+if grep -q 'history-undo' "$SCRIPT_SRC"; then
+    pass "apt 3.x rollback guidance present (Ubuntu 26.04)"
+else
+    fail "apt 3.x rollback guidance missing"
+fi
+
+# systemd unit: UMask typo regression
+if grep -qE '^[[:space:]]*Umask=' "$REPO/systemd/controlled-system-update.service"; then
+    fail "systemd unit uses 'Umask=' (silently ignored); must be 'UMask='"
+else
+    pass "systemd unit uses the correct 'UMask=' directive"
+fi
+
+if grep -q 'TimeoutStartSec=5400' "$REPO/systemd/controlled-system-update.service"; then
+    pass "systemd TimeoutStartSec raised to 90 minutes"
+else
+    warn "systemd TimeoutStartSec is not 5400 (slow arm64 hosts may time out)"
+fi
+
+# Sourcing guard enables unit testing
+if grep -q 'CSU_SOURCE_ONLY' "$SCRIPT_SRC"; then
+    pass "CSU_SOURCE_ONLY sourcing guard present"
+else
+    fail "CSU_SOURCE_ONLY sourcing guard missing"
+fi
+
+# Safety-gate unit tests exist and pass
+if [[ -f "$REPO/tests/safety-gate-test.sh" ]]; then
+    pass "Safety-gate unit test suite present"
+    if bash "$REPO/tests/safety-gate-test.sh" >/tmp/csu-safety-gate.out 2>&1; then
+        pass "Safety-gate unit tests pass ($(grep -c '^PASS' /tmp/csu-safety-gate.out) assertions)"
+    else
+        fail "Safety-gate unit tests FAILED (see /tmp/csu-safety-gate.out)"
+    fi
+else
+    fail "Safety-gate unit test suite missing"
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

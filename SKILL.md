@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 2.6.0
+version: 3.0.0
 platforms: [linux]
 metadata:
   hermes:
@@ -26,7 +26,9 @@ Expert Linux sysadmin/SRE procedure for comprehensive server updates: OS package
 
 The following is an example deployment profile. Adjust paths and services for your specific host.
 
-- OS: Ubuntu, kernel 6.8, package manager `apt`
+- OS: Ubuntu 24.04 LTS (kernel 6.8), package manager `apt-get`
+  (the script also supports Ubuntu 22.04 → 26.04 LTS and Debian 12+, on
+  amd64 and arm64; OS/arch/apt-generation are detected at runtime)
 - Hermes: root-host git-clone at `/usr/local/lib/hermes-agent`
 - Venv: managed by `uv` — no pip binary
 - CLI: `/usr/local/bin/hermes`
@@ -85,7 +87,12 @@ Key settings:
 - `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
 - `HERMES_SKILLS_SCOPE` — include all Hermes-managed sources: GitHub, URL, tap, hub, community (default: all)
 - `HERMES_SKILLS_TIMEOUT` — timeout for skill operations in seconds (default: 600)
+- `NOTIFY_LEVEL` — Telegram volume: `error`, `warning` (default), `always`
+- `INCLUDE_PHASED_UPDATES` — take Ubuntu phased updates immediately (default: false)
 - `DIAGNOSTIC_ENABLED` — run comprehensive post-update diagnostic (default: true)
+- `DIAGNOSTIC_ADVISORY` — categories reported but never auto-remediated (default: `journal memory load`)
+- `REMEDIATE_ON_ACTIONABLE_ONLY` — skip remediation when only advisory findings exist (default: true)
+- `REMEDIATION_CMD_TIMEOUT` — hard timeout per remediation command in seconds (default: 120)
 - `LLM_REMEDIATION_ENABLED` — attempt LLM-based auto-remediation when diagnostic finds issues (default: true)
 - `LLM_API_URL` — OpenAI-compatible chat completions endpoint (default: OpenRouter)
 - `LLM_MODEL` — model to use for remediation suggestions (default: z-ai/glm-5.2)
@@ -111,7 +118,34 @@ After all update phases and basic health checks, the script runs a comprehensive
 12. **dmesg errors** — filesystem/hardware errors
 13. **Load average**
 
-If the diagnostic finds issues and `LLM_REMEDIATION_ENABLED=true`, the report is sent to an LLM (OpenAI-compatible API) which suggests remediation commands. Each command is safety-checked against a blocklist (no `rm -rf /`, `mkfs`, `dd`, `shutdown`, `reboot`, `purge`, `curl | sh`, etc.) before execution. The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times, re-running the diagnostic after each remediation round.
+Findings are classified as **actionable** (broken packages, failed units, dead
+containers, gateway down — fixable by a command) or **advisory** (journal
+noise, memory, load — reported only). With `REMEDIATE_ON_ACTIONABLE_ONLY=true`
+(default), advisory-only runs skip remediation entirely. This is what stops a
+healthy-but-busy host from generating nightly remediation churn.
+
+If actionable issues are found and `LLM_REMEDIATION_ENABLED=true`, the report
+goes to an LLM which suggests remediation commands. Each suggestion must pass
+**two gates**:
+
+1. **Allowlist** — must match a known-safe form: `systemctl
+   restart|start|reload|reset-failed <unit>`, `systemctl daemon-reload`,
+   `docker restart|start <container>`, `docker compose up -d`,
+   `docker image|system prune -f`, `apt-get install -f|check|update|autoclean`,
+   `dpkg --configure -a`, `journalctl --vacuum-size=|--vacuum-time=`,
+   `hermes gateway restart|status`, `hermes doctor`, `needrestart -r a`,
+   `snap refresh`. Anything else is rejected.
+2. **Blocklist** — destructive patterns AND never-ending commands
+   (`hermes gateway run`, `hermes serve`, `tail -f`, `journalctl -f`, `watch`,
+   long `sleep`) are rejected even if gate 1 passed.
+
+Shell metacharacters (`;` `|` `&` `` ` `` `$(` `>` `<`) are rejected outright,
+commands run **without `eval`** as an argv array, and each runs under
+`REMEDIATION_CMD_TIMEOUT`. The gates are covered by 44 assertions in
+`tests/safety-gate-test.sh` (run in CI).
+
+The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times, re-running the
+diagnostic after each round.
 
 The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
 
@@ -163,7 +197,8 @@ sudo systemctl enable --now controlled-system-update.timer
 - Package holds respected (apt-mark hold)
 - Low priority (Nice=10, CPUWeight=50) — won't starve production services
 - Memory limit (1G) on systemd service
-- `Umask=0077` on systemd service — restricts file creation permissions
+- `UMask=0077` on systemd service — restricts file creation permissions
+  (the key is `UMask`, capital M; `Umask=` is silently ignored by systemd)
 - `needrestart` integration: auto-restarts services after library upgrades (if installed)
 - Log rotation: auto-deletes log files older than `LOG_RETENTION_DAYS` (default: 30)
 - `last-run.log` is a symlink to the most recent run's log file
@@ -173,6 +208,12 @@ sudo systemctl enable --now controlled-system-update.timer
 - Hermes hub skills updated via `hermes skills check/update` (never `--force`)
 - Configuration secrets are not exported to child processes (no `set -a`)
 - Configuration ownership and permissions validated before sourcing
+- All logging goes to stderr; only data goes to stdout, so log lines can never
+  be captured by command substitution and executed
+- Gateway liveness detected by the real interpreter invocation and systemd unit
+  state, not a loose `pgrep` that matches any process mentioning the words
+- A `hermes update` that pulls successfully but fails its own gateway relaunch
+  is recovered with a bounded `hermes gateway restart` instead of failing
 - GitHub Actions CI with ShellCheck linting on every push
 
 ## Mode 2 — Manual Controlled Update (SRE procedure)
@@ -400,6 +441,20 @@ not automatically force replacement of local edits.
 - Invoking a gateway restart from an active Hermes conversation may disconnect that conversation
 - Do not use `--force` with `hermes skills update` — locally modified hub skills are intentionally preserved
 - Root running git in a user-owned checkout fails with "dubious ownership" — never fix with a global `safe.directory=*`; the script's runuser privilege drop is the correct fix
+- Never run `hermes gateway run --replace` from an unattended script: it runs
+  in the foreground and holds the systemd unit open until `TimeoutStartSec`
+  kills the whole update. Use the bounded `hermes gateway restart`.
+- A helper that both logs and returns data must log to **stderr**; logging to
+  stdout splices log lines into the caller's command substitution
+- `Umask=` is not a systemd directive (it is `UMask=`); systemd ignores unknown
+  keys with only a journal warning, so the setting silently does nothing
+- `pgrep -f 'hermes.*gateway run'` matches admin greps, script subshells and
+  agent sessions — it reports a gateway that is not there
+- `hermes update` may exit non-zero after successfully pulling and installing
+  the new code, when only its own gateway relaunch crashed; retrying the update
+  does not help, restarting the gateway does
+- On Ubuntu 26.04+ (apt 3.x) a failed upgrade can be rolled back with
+  `apt history-info 0` then `sudo apt history-undo 0`
 
 ## Related Skills
 
