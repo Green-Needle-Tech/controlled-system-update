@@ -238,6 +238,12 @@ LLM_MAX_REMEDIATION_ATTEMPTS="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
 # whole TimeoutStartSec budget of the systemd unit.
 REMEDIATION_CMD_TIMEOUT="${REMEDIATION_CMD_TIMEOUT:-120}"
 
+# Timeout for `hermes gateway restart`. This is NOT the skills timeout: the
+# gateway drains in-flight agent turns before stopping, so the command can
+# legitimately run for many minutes. It must still be bounded, and it must be
+# comfortably below the unit's TimeoutStartSec.
+HERMES_GATEWAY_RESTART_TIMEOUT="${HERMES_GATEWAY_RESTART_TIMEOUT:-600}"
+
 # Notification policy:
 #   error   — notify only on errors (quietest)
 #   warning — notify on errors and warnings (default, legacy behaviour)
@@ -690,8 +696,30 @@ gateway_is_running() {
 # kills the whole update (the 2026-09-16 failure).
 restart_hermes_gateway() {
     [[ -x "$HERMES_CLI" ]] || return 1
-    log_info "Restarting Hermes gateway (bounded)..."
-    if run_hermes_with_timeout gateway restart >>"$LOG_FILE" 2>&1; then
+
+    # Self-deadlock guard. `hermes gateway restart` drains in-flight agent
+    # turns before stopping (up to agent.restart_after_turn_timeout +
+    # restart_drain_timeout, which can be ~30 min). If this script is itself
+    # running inside an agent turn — e.g. an operator ran it from a Hermes
+    # session rather than the systemd timer — the gateway waits for this very
+    # process to finish while this process waits for the gateway. Neither
+    # yields, and only the outer timeout breaks it. Observed 2026-09-17.
+    if [[ -n "${HERMES_AGENT:-}${AI_AGENT:-}${HERMES_UI_SESSION_ID:-}" ]]; then
+        log_warn "Running inside a Hermes agent session — skipping gateway restart to avoid a drain deadlock"
+        add_warning "Hermes" \
+            "Gateway restart skipped: running inside an agent session. Restart manually with 'hermes gateway restart'."
+        return 1
+    fi
+
+    log_info "Restarting Hermes gateway (bounded to ${HERMES_GATEWAY_RESTART_TIMEOUT}s)..."
+    if hermes_privileged_cmd timeout \
+        --signal=TERM \
+        --kill-after=30s \
+        "$HERMES_GATEWAY_RESTART_TIMEOUT" \
+        env \
+        HOME="$HERMES_USER_HOME" \
+        HERMES_HOME="$HERMES_HOME" \
+        "$HERMES_CLI" gateway restart >>"$LOG_FILE" 2>&1; then
         sleep 5
         if gateway_is_running; then
             log_info "Hermes gateway restarted successfully"
@@ -1663,6 +1691,19 @@ run_diagnostic_and_remediate() {
             if ! is_command_safe "$cmd"; then
                 blocked=$((blocked + 1))
                 add_warning "LLM Remediation" "Blocked unsafe command: $cmd"
+                continue
+            fi
+
+            # `hermes gateway restart` is allowlisted and bounded, but it
+            # drains in-flight agent turns. Issued from inside an agent
+            # session it deadlocks against this very process (see
+            # restart_hermes_gateway). Route it through the guarded helper.
+            if [[ "$cmd" == "hermes gateway restart" ]]; then
+                if restart_hermes_gateway; then
+                    executed=$((executed + 1))
+                else
+                    blocked=$((blocked + 1))
+                fi
                 continue
             fi
 

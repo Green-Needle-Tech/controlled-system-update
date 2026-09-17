@@ -2,6 +2,8 @@
 
 A comprehensive, automatic + manual server update system for Linux servers running [Hermes Agent](https://github.com/NousResearch/hermes-agent) with Docker services.
 
+**v3.0.1** — Fixes a deadlock: `hermes gateway restart` drains in-flight agent turns, so issuing it from *inside* an agent session made the gateway wait for the calling process while the calling process waited for the gateway. Now guarded, with its own timeout budget.
+
 **v3.0.0** — Incident-driven hardening. Remediation is now **allowlist-gated** (a command must match a known-safe form before the blocklist is even consulted), `eval` is gone, shell metacharacters are rejected, and every command has a hard timeout. Adds **Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support, and splits diagnostic findings into *actionable* vs *advisory* so journal noise no longer triggers nightly remediation churn. See [CHANGELOG](CHANGELOG.md#300---2026-09-17) for the two production root causes this release fixes.
 
 **v2.6.0** — Full post-update diagnostic + LLM auto-remediation: after all update phases, a comprehensive diagnostic (dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg, Hermes doctor) runs automatically.
@@ -131,6 +133,7 @@ LOG_RETENTION_DAYS="30"
 # HERMES_USER_HOME="/root"
 # HERMES_CLI="/usr/local/bin/hermes"
 HERMES_UPDATE_TIMEOUT="1800"
+HERMES_GATEWAY_RESTART_TIMEOUT="600"
 
 # Hermes external skills: off, check (default), update
 HERMES_SKILLS_MODE="check"

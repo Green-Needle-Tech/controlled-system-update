@@ -3,6 +3,35 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [3.0.1] - 2026-09-17
+
+Follow-up to 3.0.0, found while verifying 3.0.0 on the reference host.
+
+### Fixed
+- **`hermes gateway restart` could deadlock the update run.** The command
+  drains in-flight agent turns before stopping (up to
+  `agent.restart_after_turn_timeout` + `restart_drain_timeout`, observed as a
+  ~1995s budget). When the script runs *inside* a Hermes agent session — an
+  operator invoking it from a session rather than via the systemd timer — the
+  gateway waits for the very process that asked it to restart, and that
+  process waits for the gateway. Neither yields; only an outer timeout breaks
+  it. A verification run was SIGTERMed at 900s this way.
+  `restart_hermes_gateway()` now detects an agent session (`HERMES_AGENT`,
+  `AI_AGENT`, `HERMES_UI_SESSION_ID`) and skips the restart with a warning
+  telling the operator to run it manually. The systemd timer path, where
+  those variables are unset, is unaffected.
+- The gateway restart was bounded by `HERMES_SKILLS_TIMEOUT` (600s), which is
+  semantically wrong and smaller than the gateway's own drain budget. It now
+  has a dedicated `HERMES_GATEWAY_RESTART_TIMEOUT` (default 600s).
+- An LLM-suggested `hermes gateway restart` bypassed the guard by going
+  through the generic remediation executor. It is now routed through the
+  guarded helper.
+
+### Added
+- `HERMES_GATEWAY_RESTART_TIMEOUT` config option.
+- Two safety-gate assertions covering the deadlock guard and its budget
+  (46 assertions total).
+
 ## [3.0.0] - 2026-09-17
 
 Incident-driven hardening release. On 2026-09-16 a production run was killed
