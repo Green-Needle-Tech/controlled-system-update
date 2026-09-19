@@ -268,6 +268,15 @@ Controlled by `NOTIFY_LEVEL`:
 
 Every message carries the host label, timestamp and platform (OS, version, architecture).
 
+### Immediate Critical Alerts
+
+With `NOTIFY_IMMEDIATE="true"` (default), a Telegram alert is sent **the moment** a
+high/critical error occurs during the run — apt failures, Docker pull/update
+failures, Hermes update failure or gateway down, disk usage critical, broken
+packages — instead of waiting for the end-of-run summary. Each alert is tagged
+`🚨 CRITICAL` and includes the affected section and detail. Set to `"false"` to
+receive only the end-of-run summary.
+
 ## Safety Features
 
 - **Atomic locking** — `flock` prevents concurrent runs (no race conditions, auto-releases on crash)

@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [3.2.0] - 2026-09-19
+
+### Added
+- **Immediate critical Telegram alerts.** `add_error` now sends a `🚨 CRITICAL`
+  Telegram message the moment a high/critical error is recorded (apt/Docker/
+  Hermes failures, gateway down, disk usage critical, broken packages), instead
+  of waiting for the end-of-run summary. Controlled by `NOTIFY_IMMEDIATE`
+  (default `true`; set `false` for summary-only notifications).
+
 ## [3.1.0] - 2026-09-19
 
 ### Changed

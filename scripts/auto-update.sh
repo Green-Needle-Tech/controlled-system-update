@@ -361,6 +361,12 @@ add_error() {
     local section="$1"; shift
     local detail="$*"
     ERRORS+="\n<b>[${section}]</b> ${detail}\n"
+    # Immediate critical alert: notify as soon as a high/critical error occurs,
+    # not only in the end-of-run summary. Toggle with NOTIFY_IMMEDIATE=false.
+    if [[ "${NOTIFY_IMMEDIATE:-true}" == "true" ]]; then
+        notify_telegram \
+            "<b>🚨 [${HOSTNAME_LABEL}] CRITICAL</b>\n[${section}] ${detail}\n\n(Sent immediately; full summary follows at end of run.)"
+    fi
 }
 
 # Track warnings (non-fatal)

@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 3.1.0
+version: 3.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -89,6 +89,7 @@ Key settings:
 - `HERMES_SKILLS_SCOPE` — include all Hermes-managed sources: GitHub, URL, tap, hub, community (default: all)
 - `HERMES_SKILLS_TIMEOUT` — timeout for skill operations in seconds (default: 600)
 - `NOTIFY_LEVEL` — Telegram volume: `error`, `warning` (default), `always`
+- `NOTIFY_IMMEDIATE` — send a Telegram alert immediately when a high/critical error occurs during the run, instead of only at end-of-run summary (default: true)
 - `INCLUDE_PHASED_UPDATES` — take Ubuntu phased updates immediately (default: false)
 - `DIAGNOSTIC_ENABLED` — run comprehensive post-update diagnostic (default: true)
 - `DIAGNOSTIC_ADVISORY` — categories reported but never auto-remediated (default: `journal memory load`)

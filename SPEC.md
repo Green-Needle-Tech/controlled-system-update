@@ -474,6 +474,11 @@ Telegram, controlled by `NOTIFY_LEVEL`:
 | Warnings | silent | message | message |
 | Errors | message | message | message |
 
+Additionally, `NOTIFY_IMMEDIATE` (default `true`) sends a `🚨 CRITICAL`
+Telegram alert **the moment** a high/critical error is recorded during the run
+(apt/Docker/Hermes failures, gateway down, disk critical, broken packages),
+rather than waiting for the end-of-run summary.
+
 Messages carry host label, timestamp, platform and log path, and are
 truncated to Telegram's 4096-character limit. A failed notification is a
 warning, never a run failure — the run's outcome does not depend on the
@@ -552,6 +557,7 @@ built-in values from `scripts/auto-update.sh` v3.0.1.
 | `TG_CHAT_ID` | *(empty)* | Telegram chat ID |
 | `HOSTNAME_LABEL` | `$(hostname -s)` | Host label in notifications |
 | `NOTIFY_LEVEL` | `warning` | `error` \| `warning` \| `always` |
+| `NOTIFY_IMMEDIATE` | `true` | Send Telegram alert immediately on high/critical errors |
 
 ### Update phases
 
