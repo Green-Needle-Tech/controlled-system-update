@@ -252,7 +252,7 @@ NOTIFY_LEVEL="${NOTIFY_LEVEL:-warning}"
 
 # Advisory diagnostic findings are recorded in the report and (optionally)
 # the notification, but do NOT trigger LLM remediation. Journal noise and
-# a disk at 81% are not things a model should try to "fix" at 04:00.
+# a disk at 81% are not things a model should try to "fix" at 01:00.
 # Space-separated subset of: journal disk memory load dns ports dmesg
 DIAGNOSTIC_ADVISORY="${DIAGNOSTIC_ADVISORY:-journal memory load}"
 

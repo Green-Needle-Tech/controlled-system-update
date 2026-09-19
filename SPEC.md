@@ -394,7 +394,7 @@ Thirteen checks, written to `${LOG_DIR}/diagnostic-report.txt`:
 
 With `REMEDIATE_ON_ACTIONABLE_ONLY="true"` (default), a run whose findings are
 all advisory skips remediation entirely. This exists because a disk at 85% or
-a noisy journal is a *human* decision; handing it to a model at 04:00
+a noisy journal is a *human* decision; handing it to a model at 01:00
 produces churn, not repair.
 
 ### 6.3 Remediation safety model
