@@ -120,7 +120,7 @@ than failing obscurely later.
 
 | Path | Command | Notes |
 |---|---|---|
-| Scheduled | `controlled-system-update.timer` → `.service` | Daily 04:00, `RandomizedDelaySec=30m`, `Persistent=false` |
+| Scheduled | `controlled-system-update.timer` → `.service` | Daily 01:00 SGT (Asia/Singapore), `RandomizedDelaySec=30m`, `Persistent=false` |
 | Manual (systemd) | `systemctl start controlled-system-update.service` | Preferred for manual runs — same environment as scheduled |
 | Manual (direct) | `/usr/local/bin/auto-update.sh` | Bypasses systemd resource limits |
 | Unit test | `CSU_SOURCE_ONLY=1 source scripts/auto-update.sh` | Loads functions without running `main` |
@@ -626,7 +626,7 @@ rebuilds a web UI; on slower arm64 hosts that plus a large image pull crowded
 the previous 3600s budget. Every inner phase has its own tighter timeout, so
 this is a backstop, not the primary control.
 
-**Timer** — `OnCalendar=*-*-* 04:00:00`, `RandomizedDelaySec=30m`,
+**Timer** — `OnCalendar=*-*-* 01:00:00 Asia/Singapore`, `RandomizedDelaySec=30m`,
 `Persistent=false`.
 
 ---

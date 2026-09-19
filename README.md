@@ -55,7 +55,7 @@ The automatic mode updates the following by default:
 
 ### Automatic Mode (default)
 
-- Runs daily at 04:00 via systemd timer (with 30min random delay)
+- Runs daily at 01:00 SGT (Asia/Singapore) via systemd timer (with 30min random delay)
 - **No user intervention** — fully unattended
 - **Telegram notification ONLY on failure or warnings** — silent on success
 - Atomic flock locking prevents concurrent runs
@@ -191,7 +191,7 @@ After all update phases and basic health checks, the script runs a comprehensive
 Findings are classified before anything is remediated:
 
 - **Actionable** — broken packages, failed units, dead/unhealthy containers, gateway down. These can be fixed by a command, so they are eligible for remediation.
-- **Advisory** — journal noise, memory pressure, load average (configurable via `DIAGNOSTIC_ADVISORY`). These are reported in the log, the report and the notification, but are **never** handed to the model. A disk at 85% is a human decision, not something to "fix" unattended at 04:00.
+- **Advisory** — journal noise, memory pressure, load average (configurable via `DIAGNOSTIC_ADVISORY`). These are reported in the log, the report and the notification, but are **never** handed to the model. A disk at 85% is a human decision, not something to "fix" unattended at 01:00.
 
 With `REMEDIATE_ON_ACTIONABLE_ONLY="true"` (default), a run with only advisory findings skips remediation entirely.
 

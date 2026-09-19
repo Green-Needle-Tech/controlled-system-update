@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 3.0.1
+version: 3.1.0
 platforms: [linux]
 metadata:
   hermes:
@@ -39,7 +39,7 @@ The following is an example deployment profile. Adjust paths and services for yo
 
 ## Mode 1 — Automatic Updates (default)
 
-Runs daily at 04:00 via systemd timer. No user intervention. Telegram notification ONLY on failure or warnings.
+Runs daily at 01:00 SGT (Asia/Singapore) via systemd timer. No user intervention. Telegram notification ONLY on failure or warnings.
 
 ### What gets updated automatically (defaults)
 

@@ -3,8 +3,8 @@ Description=Daily Controlled System Update timer
 Documentation=https://github.com/Green-Needle-Tech/controlled-system-update
 
 [Timer]
-# Run at 04:00 with up to 30min random delay to avoid herd effects
-OnCalendar=*-*-* 04:00:00
+# Run daily at 01:00 SGT (Asia/Singapore, UTC+08) with up to 30min random delay to avoid herd effects
+OnCalendar=*-*-* 01:00:00 Asia/Singapore
 RandomizedDelaySec=30m
 # If the machine was off, don't catch up on missed runs
 Persistent=false

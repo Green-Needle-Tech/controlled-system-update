@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [3.1.0] - 2026-09-19
+
+### Changed
+- **Timer now runs at 01:00 SGT (Asia/Singapore) instead of 04:00 (server-local time).**
+  `OnCalendar=*-*-* 01:00:00 Asia/Singapore` pins the schedule to UTC+08
+  regardless of the host's timezone setting. Re-run `install.sh` (or
+  `systemctl daemon-reload`) to apply.
+
 ## [3.0.1] - 2026-09-17
 
 Follow-up to 3.0.0, found while verifying 3.0.0 on the reference host.
