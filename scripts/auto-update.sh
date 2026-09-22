@@ -760,9 +760,9 @@ update_hermes_agent() {
 
     log_info "Hermes version after update: $new_version"
 
-    # `hermes doctor` can block on network probes — bound it.
-    if ! run_hermes_with_timeout doctor >>"$LOG_FILE" 2>&1; then
-        add_warning "Hermes" "hermes doctor reported problems after update"
+    # `hermes doctor --fix` can block on network probes — bound it.
+    if ! run_hermes_with_timeout doctor --fix >>"$LOG_FILE" 2>&1; then
+        add_warning "Hermes" "hermes doctor --fix reported problems after update"
     fi
 
     # Verify the gateway actually survived the update.
@@ -1164,8 +1164,8 @@ run_full_diagnostic() {
         fi
 
         local hermes_doctor
-        hermes_doctor="$(run_hermes_with_timeout doctor 2>&1 || true)"
-        echo "--- Hermes Doctor ---" >> "$report"
+        hermes_doctor="$(run_hermes_with_timeout doctor --fix 2>&1 || true)"
+        echo "--- Hermes Doctor (--fix) ---" >> "$report"
         echo "$hermes_doctor" >> "$report"
         echo "" >> "$report"
         if echo "$hermes_doctor" | grep -qiE 'fail|error|not found|missing'; then
