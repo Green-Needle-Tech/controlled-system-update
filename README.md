@@ -10,13 +10,11 @@ your attention.
 - **[SKILL.md](SKILL.md)** — Hermes agent skill + manual SRE procedure
 - **[CHANGELOG.md](CHANGELOG.md)** — version history
 
-**Latest — v3.0.1.** LLM remediation is **allowlist-gated**: a command must
-match a known-safe form before the blocklist is even consulted, `eval` is
-gone, shell metacharacters are rejected and every command is time-bounded.
-Adds **Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support, and splits
-diagnostic findings into *actionable* vs *advisory* so journal noise no longer
-triggers nightly remediation churn. The 3.0.x line was driven by three real
-production defects — see [incident history](SPEC.md#8-incident-history).
+**Latest — v4.0.0.** LLM auto-remediation has been **removed** in favour of a
+**compulsory server reboot** after every update run — a clean restart is a
+simpler, more reliable recovery than asking a model to patch a broken host.
+The comprehensive post-update diagnostic is retained for reporting. Adds
+**Ubuntu 26.04 LTS (Resolute Raccoon)** and **arm64** support.
 
 ## Supported Platforms
 
@@ -44,12 +42,12 @@ The automatic mode updates the following by default:
 | Hermes Agent | `hermes update --yes` (supported updater) | enabled |
 | Hermes external skills | `hermes skills check` (report only) | enabled |
 | Full diagnostic | dpkg audit, broken deps, journal errors, Docker health, network/DNS, dmesg | enabled |
-| LLM auto-remediation | Send diagnostic to LLM, safety-check + execute suggested commands | enabled |
+
 | Python/uv tools | uv tool upgrade | **opt-in** |
 | npm global packages | npm update -g | **opt-in** |
 | dist-upgrade | apt-get dist-upgrade | **opt-in** |
 | autoremove | apt-get autoremove | **opt-in** |
-| auto-reboot | shutdown -r | **opt-in** |
+| compulsory reboot | shutdown -r after every run | enabled |
 
 ## Two Modes
 
@@ -123,8 +121,7 @@ UPDATE_PYTHON="false"   # opt-in
 # Packages to hold (never auto-upgrade)
 PKG_HOLDS=""
 
-# Auto-reboot (opt-in, default: false)
-AUTO_REBOOT="false"
+# Compulsory reboot after every run (delay in minutes, cancel with shutdown -c)
 REBOOT_DELAY="5"
 
 # dist-upgrade (opt-in, default: false)
@@ -149,21 +146,8 @@ HERMES_SKILLS_AUDIT="true"
 HERMES_SKILLS_SCOPE="all"
 HERMES_SKILLS_TIMEOUT="600"
 
-# Full diagnostic + LLM auto-remediation
+# Full diagnostic (reporting only, no auto-remediation)
 DIAGNOSTIC_ENABLED="true"
-LLM_REMEDIATION_ENABLED="true"
-LLM_API_URL="https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL="z-ai/glm-5.2"
-# LLM_API_KEY=""  # auto-detected from ~/.hermes/.env
-LLM_TIMEOUT="120"
-LLM_MAX_REMEDIATION_ATTEMPTS="3"
-
-# Hard timeout per remediation command (seconds)
-REMEDIATION_CMD_TIMEOUT="120"
-
-# Only remediate actionable findings; advisory ones are reported only
-REMEDIATE_ON_ACTIONABLE_ONLY="true"
-DIAGNOSTIC_ADVISORY="journal memory load"
 
 # Notification volume: error | warning | always
 NOTIFY_LEVEL="warning"
@@ -172,7 +156,7 @@ NOTIFY_LEVEL="warning"
 INCLUDE_PHASED_UPDATES="false"
 ```
 
-## Full Diagnostic + LLM Auto-Remediation
+## Full Diagnostic
 
 After all update phases and basic health checks, the script runs a comprehensive diagnostic:
 
@@ -186,39 +170,24 @@ After all update phases and basic health checks, the script runs a comprehensive
 - **Network** — default gateway reachability + DNS resolution
 - **dmesg errors** — filesystem/hardware errors
 
-### Actionable vs advisory findings
+Findings are reported in the log, the diagnostic report file
+(`/var/log/controlled-system-update/diagnostic-report.txt`), and the Telegram
+notification. No automated remediation is attempted — the script schedules a
+**compulsory reboot** after every run instead, on the principle that a clean
+restart is more reliable than patching a broken host unattended at 01:00.
 
-Findings are classified before anything is remediated:
+## Compulsory Reboot
 
-- **Actionable** — broken packages, failed units, dead/unhealthy containers, gateway down. These can be fixed by a command, so they are eligible for remediation.
-- **Advisory** — journal noise, memory pressure, load average (configurable via `DIAGNOSTIC_ADVISORY`). These are reported in the log, the report and the notification, but are **never** handed to the model. A disk at 85% is a human decision, not something to "fix" unattended at 01:00.
+After all update phases, health checks, and diagnostic are complete, a
+**compulsory reboot** is scheduled via `shutdown -r +REBOOT_DELAY` (default:
+5 minutes). A Telegram notification is sent before the reboot so you know
+it's coming. Cancel with `shutdown -c`.
 
-With `REMEDIATE_ON_ACTIONABLE_ONLY="true"` (default), a run with only advisory findings skips remediation entirely.
-
-### How remediation is gated
-
-If actionable issues are found and `LLM_REMEDIATION_ENABLED=true`, the report is sent to an LLM which suggests remediation commands. Each suggestion passes through two gates before it can run:
-
-1. **Allowlist (gate 1)** — the command must match a known-safe remediation form:
-   `systemctl restart|start|reload|reset-failed <unit>`, `systemctl daemon-reload`,
-   `docker restart|start <container>`, `docker compose up -d`, `docker image|system prune -f`,
-   `apt-get install -f` / `check` / `update` / `autoclean`, `dpkg --configure -a`,
-   `journalctl --vacuum-size=|--vacuum-time=`, `hermes gateway restart|status`,
-   `hermes doctor`, `needrestart -r a`, `snap refresh`.
-   Anything unrecognised is rejected. A blocklist alone cannot be sound against free-form text produced by a model.
-2. **Blocklist (gate 2)** — destructive patterns (`rm -rf /`, `mkfs`, `dd of=/dev/`, `shutdown`, `reboot`, `apt purge`, `systemctl disable|mask`, `curl | sh`, fork bombs) **and never-ending commands** (`hermes gateway run`, `hermes serve`, `tail -f`, `journalctl -f`, `watch`, `sleep 1000`) are rejected even if gate 1 passed.
-
-Additionally:
-
-- Shell metacharacters (`;` `|` `&` `` ` `` `$(` `>` `<`) are rejected outright, so an allowed verb cannot smuggle a second command (`systemctl restart nginx; rm -rf /var`).
-- Commands are executed **without `eval`**, as an argv array.
-- Each command runs under a hard `REMEDIATION_CMD_TIMEOUT`, so one hung command cannot consume the systemd unit's whole time budget.
-- Text that looks like a log line is rejected as a command.
-- An allowlisted `hermes gateway restart` is routed through a guarded helper, so it cannot deadlock when the tool runs inside a Hermes agent session (see [SPEC §8.3](SPEC.md#83-gateway-restart-deadlock-2026-09-17)).
-
-The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times. These gates are covered by 46 assertions in `tests/safety-gate-test.sh`, run in CI on amd64 and arm64.
-
-The LLM API key is auto-detected from `~/.hermes/.env` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`). The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
+This replaces the previous opt-in `AUTO_REBOOT` (which only rebooted when
+`/var/run/reboot-required` was present) and the LLM auto-remediation loop. A
+clean restart after updates is the simplest reliable recovery: it picks up
+new kernels, restarts all services with upgraded libraries, and clears any
+transient state.
 
 ## Usage
 
@@ -287,11 +256,11 @@ receive only the end-of-run summary.
 - **Low priority** — Nice=10, CPUWeight=50, IO best-effort — won't starve production
 - **Memory limit** — 1G cap on systemd service
 - **UMask=0077** — restricts file creation permissions on the systemd service (note: `Umask=` is *not* a systemd directive and is silently ignored; CI rejects the typo)
-- **Allowlist-gated remediation** — see above; no `eval`, no metacharacters, per-command timeout
+- **Compulsory reboot** — a clean restart after every run; no LLM-based auto-remediation
 - **Precise gateway detection** — matches the real interpreter invocation and systemd unit state, not any process whose command line merely mentions "hermes gateway run"
 - **Partial-update recovery** — a `hermes update` that pulls successfully but fails its own gateway relaunch is recovered with a bounded `hermes gateway restart` rather than failing the run
 - **Deadlock guard** — the gateway restart drains in-flight agent turns, so it is skipped (with a warning) when the tool runs inside a Hermes agent session; the systemd timer path is unaffected
-- **Deferred reboot** — reboot scheduling occurs only after all update and verification phases
+- **Compulsory reboot** — scheduled after all update and verification phases; cancel with `shutdown -c`
 - **needrestart** — automatically restarts services after library upgrades (if installed)
 - **Log rotation** — auto-deletes log files older than 30 days (configurable)
 - **last-run.log** — symlink to most recent run's log file
@@ -300,13 +269,13 @@ receive only the end-of-run summary.
 - **External-skill-safe** — `hermes skills check` by default; never uses `--force` (locally modified skills preserved); covers all provenance-tracked GitHub, URL, tap, and hub-installed skills
 - **Docker-safe** — groups containers by Compose project, uses Compose labels, official Docker Hub images not misclassified as local
 - **No catch-up** — `Persistent=false` on timer, missed runs don't pile up
-- **CI** — ShellCheck linting, safety-gate unit tests, a syntax matrix across `ubuntu-24.04` / `ubuntu-24.04-arm` / `ubuntu-latest`, and systemd unit-file validation on every push
+- **CI** — ShellCheck linting, gateway guard unit tests, a syntax matrix across `ubuntu-24.04` / `ubuntu-24.04-arm` / `ubuntu-latest`, and systemd unit-file validation on every push
 
 ## File Structure
 
 ```
 controlled-system-update/
-├── .github/workflows/lint.yml         # ShellCheck + safety gate + arch matrix + unit checks
+├── .github/workflows/lint.yml         # ShellCheck + gateway guard + arch matrix + unit checks
 ├── CHANGELOG.md                       # Version history
 ├── SPEC.md                            # Specification: guarantees, safety model, incidents
 ├── SKILL.md                           # Full SRE procedure + auto-mode docs
@@ -315,7 +284,7 @@ controlled-system-update/
 ├── install.sh                         # One-command installer (preserves config)
 ├── e2e-test.sh                        # End-to-end test suite (non-destructive by default)
 ├── tests/
-│   └── safety-gate-test.sh            # Unit tests for the remediation safety gate
+│   └── gateway-guard-test.sh          # Unit tests for the gateway restart deadlock guard
 ├── scripts/
 │   └── auto-update.sh                 # Main automatic update script
 ├── config/

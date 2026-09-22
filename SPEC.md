@@ -24,19 +24,17 @@ document is a bug. Every value quoted here was read from
 An unattended update runner for Debian/Ubuntu hosts running Docker services
 and, optionally, [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 It updates OS packages, Snap packages, Docker images, Hermes Agent and Hermes
-skills; verifies the host afterwards; and optionally asks an LLM to suggest
-repairs for defects it finds.
+skills; verifies the host afterwards; and schedules a compulsory reboot.
 
 ### 1.2 What this tool is not
 
 - **Not a configuration manager.** It does not converge a host to a declared
   state. It applies vendor updates and reports the result.
 - **Not a backup system.** It takes no snapshots. On btrfs/ZFS or a VM,
-  take a snapshot before enabling `AUTO_REBOOT` or `DIST_UPGRADE`.
+  take a snapshot before enabling `DIST_UPGRADE`.
 - **Not a monitoring system.** It runs once a day and reports on that run.
-- **Not an autonomous repair agent.** The LLM may only execute commands from
-  a fixed allowlist (§6.3). It cannot write files, install packages, change
-  configuration, or run arbitrary shell.
+- **Not an autonomous repair agent.** It does not attempt to fix issues
+  automatically; it runs a diagnostic for reporting and reboots the host.
 
 ### 1.3 Trust boundaries
 
@@ -46,23 +44,11 @@ The tool runs as **root**. Three inputs cross a trust boundary into it:
 |---|---|---|
 | Configuration file | Trusted | Ownership + permissions validated before sourcing (§3.2) |
 | Distribution package repositories | Trusted | Standard apt signature verification; outside this tool's remit |
-| **LLM API response** | **Untrusted** | Allowlist + blocklist + metacharacter rejection + no `eval` + per-command timeout (§6.3) |
-
-The LLM response is the only untrusted input that can influence command
-execution, and it is the component this specification constrains most
-tightly. **A blocklist alone is not a sound control against free-form text
-produced by a model**; the design therefore requires a positive match against
-a known-safe form before any rejection rule is even consulted.
-
 ### 1.4 Non-goals of the safety model
 
-The safety model prevents the LLM from taking destructive, irreversible or
-unbounded action. It does **not** attempt to prevent a *sufficiently
-adversarial model* from causing a service restart or a cache prune. An
-attacker who fully controls the LLM endpoint can, at worst, restart
-allowlisted services and prune Docker images. Operators who consider that
-unacceptable should set `LLM_REMEDIATION_ENABLED="false"`, which keeps the
-diagnostic and disables execution entirely.
+The tool does not attempt to repair issues automatically. It runs a
+diagnostic for reporting, schedules a compulsory reboot, and leaves
+all repair decisions to the operator.
 
 ---
 
@@ -135,7 +121,7 @@ resume its normal daily cadence, not execute a backlog of missed runs at boot.
 2. **Ownership check** — must be owned by uid 0, else abort.
 3. **Permission check** — must not be group- or world-writable, else abort.
 4. Sourced directly. **`set -a` is deliberately not used**: exporting the
-   config would leak `TG_BOT_TOKEN` and `LLM_API_KEY` into the environment of
+   config would leak `TG_BOT_TOKEN` into the environment of
    every child process (`apt`, `docker`, `git`, `npm`).
 
 Precedence: environment > config file > built-in default.
@@ -167,7 +153,7 @@ acquire_lock
   7. update_python_packages
   8. update_npm_packages
   9. run_health_checks
- 10. run_diagnostic_and_remediate
+ 10. run_full_diagnostic (reporting only)
  11. schedule_reboot_if_required
 ```
 
@@ -210,21 +196,19 @@ incident in which log lines were executed as shell commands (§8.1).
    indefinitely.
 4. **Held packages are never upgraded.** `PKG_HOLDS` is applied via
    `apt-mark hold` before the upgrade.
-5. **The LLM cannot execute a command outside the allowlist** (§6.3).
-6. **Secrets are not exported to child processes** (§3.2) and are not written
+5. **Secrets are not exported to child processes** (§3.2) and are not written
    to the log.
-7. **Concurrent runs are impossible** (§3.3).
-8. **No package is removed** unless the operator opts into `AUTO_REMOVE` or
+6. **Concurrent runs are impossible** (§3.3).
+7. **No package is removed** unless the operator opts into `AUTO_REMOVE` or
    `DIST_UPGRADE`.
-9. **No reboot occurs** unless the operator opts into `AUTO_REBOOT`.
+8. **A compulsory reboot is scheduled** after every run (cancel with
+   `shutdown -c`).
 
 ### 4.2 What the tool explicitly does not guarantee
 
 1. **That an update will not break your services.** It applies vendor
    updates. Use `PKG_HOLDS`, and snapshot before enabling `DIST_UPGRADE`.
-2. **That the LLM's suggestions are correct.** They are *bounded*, not
-   *correct*. A permitted command may still be the wrong one.
-3. **Atomicity.** There is no transaction across phases. On apt 3.x
+2. **Atomicity.** There is no transaction across phases. On apt 3.x
    (Ubuntu 26.04+) a failed upgrade can be rolled back manually with
    `apt history-undo`; the tool surfaces this hint but never rolls back
    automatically.
@@ -359,7 +343,7 @@ home cause later breakage.
 
 ---
 
-## 6. Verification and remediation
+## 6. Verification
 
 ### 6.1 Health checks
 
@@ -385,82 +369,14 @@ Thirteen checks, written to `${LOG_DIR}/diagnostic-report.txt`:
 12. `dmesg` errors
 13. Load average
 
-**Findings are classified before anything is remediated:**
+Findings are reported in the diagnostic report, the log, and the Telegram
+notification. No automated remediation is attempted — the script schedules a
+compulsory reboot after every run instead.
 
-| Class | Meaning | Eligible for remediation |
-|---|---|---|
-| **Actionable** | A concrete defect a command can fix: broken packages, failed units, dead or unhealthy containers, gateway down | Yes |
-| **Advisory** | Pressure and noise signals: journal errors, memory, load — configurable via `DIAGNOSTIC_ADVISORY` | **No** |
+### 6.3 Test coverage
 
-With `REMEDIATE_ON_ACTIONABLE_ONLY="true"` (default), a run whose findings are
-all advisory skips remediation entirely. This exists because a disk at 85% or
-a noisy journal is a *human* decision; handing it to a model at 01:00
-produces churn, not repair.
-
-### 6.3 Remediation safety model
-
-When actionable findings exist and `LLM_REMEDIATION_ENABLED="true"`, the
-diagnostic report is sent to an OpenAI-compatible endpoint. Suggested commands
-are returned one per line prefixed `CMD: `.
-
-Every suggested command passes **five** independent controls:
-
-**Control 1 — Structural rejection.** Any command containing `;` `|` `&`
-`` ` `` `$(` `${` `>` or `<` is rejected. Without this, an allowlisted verb
-can smuggle a second command:
-`systemctl restart nginx; rm -rf /var`.
-
-**Control 2 — Log-line rejection.** Text matching a log-line prefix
-(`[YYYY-...`) is rejected. Defence in depth against §8.1.
-
-**Control 3 — Allowlist (positive match required).** The command must match
-one of these forms, anchored at both ends:
-
-| Form |
-|---|
-| `systemctl restart\|start\|reload\|reset-failed <unit>` |
-| `systemctl --user restart\|start\|reload\|reset-failed <unit>` |
-| `systemctl daemon-reload` |
-| `docker restart\|start <container>` |
-| `docker compose [-f <file>] up -d [service...]` |
-| `docker image prune -f` / `docker system prune -f` |
-| `apt-get install -f \| check \| update \| autoclean` |
-| `dpkg --configure -a` |
-| `journalctl --vacuum-size=<n>` / `--vacuum-time=<t>` |
-| `hermes gateway restart\|status` |
-| `hermes doctor` |
-| `needrestart -r a` |
-| `snap refresh` |
-
-Anything unrecognised is rejected and logged.
-
-**Control 4 — Blocklist.** Applied even after an allowlist match. Covers
-destructive and irreversible operations (`rm -rf /`, `mkfs`, `dd of=/dev/`,
-`shutdown`, `reboot`, `fdisk`, `wipefs`, fork bombs, `curl|sh`,
-`apt remove/purge`, `systemctl disable/mask`, `pip/npm uninstall`) **and
-never-ending commands** (`hermes gateway run`, `hermes serve`, `tail -f`,
-`journalctl -f`, `docker attach`, `watch`, long `sleep`). The second group
-exists because a foreground command does not damage the host — it hangs the
-update until systemd kills it (§8.2).
-
-**Control 5 — Bounded execution.** Commands are split into an argv array and
-executed **without `eval`**, under a hard `REMEDIATION_CMD_TIMEOUT`. Timeouts
-are reported distinctly from failures.
-
-Additionally, an allowlisted `hermes gateway restart` is routed through the
-guarded helper rather than executed generically, so the agent-session
-deadlock guard (§8.3) cannot be bypassed.
-
-The diagnose → remediate → re-diagnose cycle repeats at most
-`LLM_MAX_REMEDIATION_ATTEMPTS` times, and stops early if a round executes no
-commands.
-
-### 6.4 Test coverage of the safety model
-
-`tests/safety-gate-test.sh` asserts the model directly — 46 assertions
-covering allowlist acceptance, both production incidents, metacharacter
-smuggling, destructive commands, never-ending commands, and the deadlock
-guard. It runs in CI on amd64 and arm64.
+`tests/gateway-guard-test.sh` asserts the gateway restart deadlock guard
+directly. It runs in CI on amd64 and arm64.
 
 ---
 
@@ -490,6 +406,12 @@ availability of a chat service.
 
 These are the defects that shaped the current design. They are recorded
 because the constraints they justify look arbitrary without them.
+
+> **v4.0.0 note:** Incidents §8.1–8.3 occurred under the LLM auto-remediation
+> feature, which has since been **removed entirely**. The compulsory reboot
+> replaces it. These records are retained as historical context for the
+> design constraints they influenced (stderr logging, gateway deadlock guard,
+> per-command timeouts).
 
 ### 8.1 Log output executed as shell commands (2026-09-16)
 
@@ -527,8 +449,7 @@ gateway. Neither yields; only an outer timeout breaks the cycle.
 **Fixes:** `restart_hermes_gateway()` detects an agent session via
 `HERMES_AGENT` / `AI_AGENT` / `HERMES_UI_SESSION_ID` and skips the restart
 with an actionable warning; a dedicated `HERMES_GATEWAY_RESTART_TIMEOUT`
-replaces the semantically wrong `HERMES_SKILLS_TIMEOUT`; the LLM path routes
-through the guarded helper.
+replaces the semantically wrong `HERMES_SKILLS_TIMEOUT`.
 
 **Consequence to be aware of:** a gateway restart is *skipped*, not performed,
 when the tool is run from inside an agent session. The systemd timer path —
@@ -547,7 +468,7 @@ with the default umask while appearing configured.
 ## 9. Configuration reference
 
 All values are overridable by environment variable. Defaults below are the
-built-in values from `scripts/auto-update.sh` v3.0.1.
+built-in values from `scripts/auto-update.sh` v4.0.0.
 
 ### Notification
 
@@ -577,8 +498,7 @@ built-in values from `scripts/auto-update.sh` v3.0.1.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AUTO_REBOOT` | `false` | Reboot when required (opt-in) |
-| `REBOOT_DELAY` | `5` | Minutes before reboot; cancel with `shutdown -c` |
+| `REBOOT_DELAY` | `5` | Minutes before compulsory reboot; cancel with `shutdown -c` |
 
 ### Hermes
 
@@ -595,20 +515,11 @@ built-in values from `scripts/auto-update.sh` v3.0.1.
 | `HERMES_SKILLS_SCOPE` | `all` | Documents source-selection policy |
 | `HERMES_SKILLS_TIMEOUT` | `600` | Timeout for skill operations |
 
-### Diagnostic and remediation
+### Diagnostic
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DIAGNOSTIC_ENABLED` | `true` | Run the full diagnostic |
-| `DIAGNOSTIC_ADVISORY` | `journal memory load` | Categories reported but never remediated |
-| `REMEDIATE_ON_ACTIONABLE_ONLY` | `true` | Skip remediation when only advisory findings exist |
-| `LLM_REMEDIATION_ENABLED` | `true` | Enable LLM remediation |
-| `LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible endpoint |
-| `LLM_MODEL` | `z-ai/glm-5.2` | Model identifier |
-| `LLM_API_KEY` | *(auto)* | From `~/.hermes/.env` if unset |
-| `LLM_TIMEOUT` | `120` | Per-request timeout |
-| `LLM_MAX_REMEDIATION_ATTEMPTS` | `3` | Max diagnose→remediate rounds |
-| `REMEDIATION_CMD_TIMEOUT` | `120` | Hard timeout per remediation command |
+| `DIAGNOSTIC_ENABLED` | `true` | Run the full diagnostic (reporting only) |
 
 ### Logging
 
@@ -643,8 +554,8 @@ Changes must satisfy all of the following before merge:
 
 1. `bash -n` on every shell file.
 2. `shellcheck --severity=warning` clean.
-3. `tests/safety-gate-test.sh` passing — **mandatory for any change touching
-   `is_command_safe`, the remediation loop, or gateway handling.**
+3. `tests/gateway-guard-test.sh` passing — **mandatory for any change touching
+   gateway handling.**
 4. `e2e-test.sh` with zero failures.
 5. CI green on `ubuntu-24.04`, `ubuntu-24.04-arm` and `ubuntu-latest`.
 6. `CHANGELOG.md` updated; version bumped in `SKILL.md` frontmatter, which is
@@ -660,13 +571,4 @@ Changes must satisfy all of the following before merge:
 4. Commit, tag `vX.Y.Z`, push with tags.
 5. Confirm all CI jobs pass, then publish a GitHub release.
 
-### Adding a command to the remediation allowlist
 
-Every addition widens the blast radius of a compromised or confused model.
-Require all of:
-
-- The command is **idempotent** — safe to run twice.
-- The command **terminates on its own**, with no foreground or follow mode.
-- The command **cannot remove data** or make the host unbootable.
-- A regression assertion is added to `tests/safety-gate-test.sh`.
-- The rationale is recorded in `CHANGELOG.md`.

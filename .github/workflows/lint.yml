@@ -14,14 +14,14 @@ jobs:
         uses: ludeeus/action-shellcheck@1.1.0
         with:
           severity: warning
-          additional_files: scripts/auto-update.sh e2e-test.sh install.sh tests/safety-gate-test.sh
+          additional_files: scripts/auto-update.sh e2e-test.sh install.sh tests/gateway-guard-test.sh
 
-  safety-gate:
+  gateway-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unit-test the remediation safety gate
-        run: bash tests/safety-gate-test.sh
+      - name: Unit-test the gateway restart deadlock guard
+        run: bash tests/gateway-guard-test.sh
 
   syntax-matrix:
     # The script must parse and gate correctly on every supported Ubuntu LTS,
@@ -43,9 +43,9 @@ jobs:
           bash -n scripts/auto-update.sh
           bash -n install.sh
           bash -n e2e-test.sh
-          bash -n tests/safety-gate-test.sh
-      - name: Safety gate on this platform
-        run: bash tests/safety-gate-test.sh
+          bash -n tests/gateway-guard-test.sh
+      - name: Gateway guard on this platform
+        run: bash tests/gateway-guard-test.sh
 
   systemd-units:
     runs-on: ubuntu-latest

@@ -184,10 +184,8 @@ LAST_LOG="${LOG_DIR}/last-run.log"
 # Package holds (space-separated list to exclude from upgrades)
 PKG_HOLDS="${PKG_HOLDS:-}"
 
-# Whether to reboot if required (auto-reboot) — opt-in for safety
-AUTO_REBOOT="${AUTO_REBOOT:-false}"
-
-# Delay (in minutes) before auto-reboot
+# Delay (in minutes) before compulsory reboot — gives time to cancel if needed
+# Use `shutdown -c` to cancel a scheduled reboot
 REBOOT_DELAY="${REBOOT_DELAY:-5}"
 
 # Whether to run dist-upgrade (can remove packages — riskier)
@@ -214,29 +212,10 @@ UPDATE_NPM="${UPDATE_NPM:-false}"
 # Whether to update Python/uv tools — opt-in (not OS maintenance)
 UPDATE_PYTHON="${UPDATE_PYTHON:-false}"
 
-# Track whether a reboot is required (set during OS phase, acted on at end)
-REBOOT_REQUIRED=false
-
-# ─── Full Diagnostic + LLM Auto-Remediation ──────────────────────────────────
+# ─── Full Diagnostic ─────────────────────────────────────────────────────────
 
 # Run a comprehensive post-update diagnostic (beyond basic health checks)
 DIAGNOSTIC_ENABLED="${DIAGNOSTIC_ENABLED:-true}"
-
-# LLM-based auto-remediation: when the diagnostic finds issues, send the
-# report to an LLM which suggests remediation commands. Commands are
-# safety-checked (blocklist) before execution. The cycle repeats up to
-# LLM_MAX_REMEDIATION_ATTEMPTS times, re-running the diagnostic each round.
-LLM_REMEDIATION_ENABLED="${LLM_REMEDIATION_ENABLED:-true}"
-LLM_API_URL="${LLM_API_URL:-https://openrouter.ai/api/v1/chat/completions}"
-LLM_MODEL="${LLM_MODEL:-z-ai/glm-5.2}"
-LLM_API_KEY="${LLM_API_KEY:-}"
-LLM_TIMEOUT="${LLM_TIMEOUT:-120}"
-LLM_MAX_REMEDIATION_ATTEMPTS="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
-
-# Hard timeout for each individual remediation command. Any command that
-# outlives it is killed, so a single hung command can never consume the
-# whole TimeoutStartSec budget of the systemd unit.
-REMEDIATION_CMD_TIMEOUT="${REMEDIATION_CMD_TIMEOUT:-120}"
 
 # Timeout for `hermes gateway restart`. This is NOT the skills timeout: the
 # gateway drains in-flight agent turns before stopping, so the command can
@@ -250,18 +229,7 @@ HERMES_GATEWAY_RESTART_TIMEOUT="${HERMES_GATEWAY_RESTART_TIMEOUT:-600}"
 #   always  — always send a run summary
 NOTIFY_LEVEL="${NOTIFY_LEVEL:-warning}"
 
-# Advisory diagnostic findings are recorded in the report and (optionally)
-# the notification, but do NOT trigger LLM remediation. Journal noise and
-# a disk at 81% are not things a model should try to "fix" at 01:00.
-# Space-separated subset of: journal disk memory load dns ports dmesg
-DIAGNOSTIC_ADVISORY="${DIAGNOSTIC_ADVISORY:-journal memory load}"
-
-# Remediate only when an actionable issue is present (broken packages,
-# failed units, dead containers, gateway down). Set to false to restore
-# the pre-3.0 behaviour of remediating on any finding at all.
-REMEDIATE_ON_ACTIONABLE_ONLY="${REMEDIATE_ON_ACTIONABLE_ONLY:-true}"
-
-# Diagnostic report file (written by run_full_diagnostic, read by llm_remediate)
+# Diagnostic report file (written by run_full_diagnostic)
 DIAGNOSTIC_REPORT="${LOG_DIR}/diagnostic-report.txt"
 
 # ─── Platform detection ──────────────────────────────────────────────────────
@@ -315,10 +283,8 @@ reboot_is_required() {
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 # All log output goes to stderr on purpose. Several helpers return data on
-# stdout via command substitution (llm_get_remediation, detect_* helpers);
-# logging to stdout would splice log lines into that data. This was the root
-# cause of the 2026-09-16 incident, where "[INFO] LLM response:" was captured
-# as a remediation command and executed. main() merges stderr into the log
+# stdout via command substitution (detect_* helpers); logging to stdout
+# would splice log lines into that data. main() merges stderr into the log
 # file, so nothing is lost.
 log() {
     local level="$1"; shift
@@ -478,14 +444,13 @@ update_os_packages() {
         log_info "needrestart not installed, skipping service restart check"
     fi
 
-    # Record whether a reboot is required — do not act on it yet
+    # Log whether a reboot is required (informational — reboot is always compulsory)
     if reboot_is_required; then
-        REBOOT_REQUIRED=true
         local reboot_pkgs=""
         if [[ -f /run/reboot-required.pkgs ]]; then
             reboot_pkgs="$(sort -u /run/reboot-required.pkgs 2>/dev/null | tr '\n' ' ')"
         fi
-        log_warn "System reboot is required${reboot_pkgs:+ (packages: ${reboot_pkgs})}"
+        log_info "System reboot is required${reboot_pkgs:+ (packages: ${reboot_pkgs})} — compulsory reboot will follow"
     fi
 
     log_info "OS package update complete"
@@ -1046,48 +1011,20 @@ run_health_checks() {
     return $failures
 }
 
-# ─── Diagnostic finding classification ───────────────────────────────────────
-
-# Findings are split into two classes:
-#   actionable — a concrete defect a remediation command can fix
-#                (broken packages, failed units, dead containers, gateway down)
-#   advisory   — informational pressure signals that a model should not try
-#                to "fix" unattended (journal noise, memory, load, and any
-#                category listed in DIAGNOSTIC_ADVISORY)
-#
-# Only actionable findings trigger LLM remediation when
-# REMEDIATE_ON_ACTIONABLE_ONLY=true (the default). Advisory findings are
-# always recorded in the report and the notification summary.
-DIAG_ACTIONABLE=0
-DIAG_ADVISORY=0
-
-is_advisory_category() {
-    local category="$1" entry
-    for entry in $DIAGNOSTIC_ADVISORY; do
-        [[ "$entry" == "$category" ]] && return 0
-    done
-    return 1
-}
+# ─── Diagnostic finding logging ──────────────────────────────────────────────
 
 # diag_finding <category> <error|warning> <message>
+# Records a diagnostic finding in the report and notification system.
 diag_finding() {
     local category="$1" level="$2"; shift 2
     local msg="$*"
 
-    if is_advisory_category "$category"; then
-        DIAG_ADVISORY=$((DIAG_ADVISORY + 1))
-        add_warning "Advisory" "$msg"
-        log_warn "Advisory finding (${category}): $msg"
-        return 0
-    fi
-
-    DIAG_ACTIONABLE=$((DIAG_ACTIONABLE + 1))
     if [[ "$level" == "error" ]]; then
         add_error "Diagnostic" "$msg"
-        log_error "$msg"
+        log_error "[$category] $msg"
     else
         add_warning "Diagnostic" "$msg"
-        log_warn "$msg"
+        log_warn "[$category] $msg"
     fi
 }
 
@@ -1314,11 +1251,9 @@ run_full_diagnostic() {
     # Summary
     {
         echo "=== Diagnostic Summary ==="
-        echo "Total findings:      $issues"
-        echo "Actionable findings: $DIAG_ACTIONABLE"
-        echo "Advisory findings:   $DIAG_ADVISORY"
+        echo "Total findings: $issues"
     } >> "$report"
-    log_info "Full diagnostic complete: $issues finding(s) — ${DIAG_ACTIONABLE} actionable, ${DIAG_ADVISORY} advisory"
+    log_info "Full diagnostic complete: $issues finding(s)"
     log_info "Diagnostic report: $report"
 
     if (( issues > 0 )); then
@@ -1327,452 +1262,19 @@ run_full_diagnostic() {
     return 0
 }
 
-# ─── LLM Auto-Remediation ────────────────────────────────────────────────────
+# ─── Compulsory reboot (end of run) ──────────────────────────────────────────
 
-# Safety check for an LLM-suggested remediation command.
-#
-# Two gates, in order:
-#   1. ALLOWLIST — the command's leading verb must match a known-safe
-#      remediation form. Anything unrecognised is rejected. An allowlist is
-#      the only defensible posture for shell text produced by a model.
-#   2. BLOCKLIST — destructive, long-running or unbootable-making patterns
-#      are rejected even if the leading verb looked acceptable.
-#
-# Shell metacharacters that chain or redirect (; | & ` $( ) > <) are rejected
-# outright: they let a single "allowed" verb smuggle arbitrary commands.
-#
-# Returns 0 (safe) or 1 (blocked).
-is_command_safe() {
-    local cmd="$1"
-
-    # Empty or whitespace-only
-    if [[ -z "$(echo "$cmd" | tr -d '[:space:]')" ]]; then
-        return 1
-    fi
-
-    # Reject anything that is not a plain single command invocation.
-    # No chaining, piping, substitution, redirection or backgrounding.
-    if [[ "$cmd" =~ [\;\|\&\`\<\>] || "$cmd" == *'$('* || "$cmd" == *'${'* ]]; then
-        log_warn "Blocked command with shell metacharacters: $cmd"
-        return 1
-    fi
-
-    # Reject log lines and other non-command text (defence in depth against
-    # the 2026-09-16 class of bug where log output was parsed as a command).
-    if [[ "$cmd" =~ ^\[[0-9]{4}- ]]; then
-        log_warn "Blocked non-command text: $cmd"
-        return 1
-    fi
-
-    # Gate 1 — allowlist of remediation forms
-    local allowlist=(
-        '^systemctl[[:space:]]+(restart|start|reload|reset-failed)[[:space:]]+[A-Za-z0-9@_.:\\-]+$'
-        '^systemctl[[:space:]]+--user[[:space:]]+(restart|start|reload|reset-failed)[[:space:]]+[A-Za-z0-9@_.:\\-]+$'
-        '^systemctl[[:space:]]+daemon-reload$'
-        '^docker[[:space:]]+(restart|start)[[:space:]]+[A-Za-z0-9_.\\-]+$'
-        '^docker[[:space:]]+compose([[:space:]]+-f[[:space:]]+[^[:space:]]+)?[[:space:]]+up[[:space:]]+-d([[:space:]]+[A-Za-z0-9_.\\-]+)*$'
-        '^docker[[:space:]]+(image[[:space:]]+)?prune[[:space:]]+-f$'
-        '^docker[[:space:]]+system[[:space:]]+prune[[:space:]]+-f$'
-        '^apt-get[[:space:]]+(install[[:space:]]+-f|check|update|autoclean)([[:space:]]+-y)?$'
-        '^apt-get[[:space:]]+-y[[:space:]]+install[[:space:]]+-f$'
-        '^dpkg[[:space:]]+--configure[[:space:]]+-a$'
-        '^journalctl[[:space:]]+--vacuum-(size|time)=[A-Za-z0-9]+$'
-        '^hermes[[:space:]]+gateway[[:space:]]+(restart|status)$'
-        '^hermes[[:space:]]+doctor$'
-        '^needrestart[[:space:]]+-r[[:space:]]+a$'
-        '^snap[[:space:]]+refresh$'
-    )
-
-    local allowed=false
-    local allow_pattern
-    for allow_pattern in "${allowlist[@]}"; do
-        if echo "$cmd" | grep -qE "$allow_pattern"; then
-            allowed=true
-            break
-        fi
-    done
-
-    if [[ "$allowed" != "true" ]]; then
-        log_warn "Blocked command not on the remediation allowlist: $cmd"
-        return 1
-    fi
-
-    # Gate 2 — blocklist, applied even to allowlisted verbs
-    local blocklist=(
-        'rm[[:space:]]+-rf[[:space:]]+/'
-        'rm[[:space:]]+-rf[[:space:]]+/\*'
-        'rm[[:space:]]+-fr[[:space:]]+/'
-        'mkfs'
-        'dd[[:space:]].*of=/dev/'
-        'shutdown'
-        'reboot'
-        'halt'
-        'poweroff'
-        'init[[:space:]]+0'
-        'init[[:space:]]+6'
-        'systemctl[[:space:]]+poweroff'
-        'systemctl[[:space:]]+reboot'
-        'fdisk'
-        'parted'
-        'wipefs'
-        'chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/'
-        'chown[[:space:]]+-R[[:space:]].*[[:space:]]+/$'
-        '>[[:space:]]*/dev/sd'
-        '>[[:space:]]*/dev/nvme'
-        '>[[:space:]]*/dev/vd'
-        ':[[:space:]]*\(\)[[:space:]]*\{.*\};:'  # fork bomb
-        'curl.*\|[[:space:]]*sh'
-        'curl.*\|[[:space:]]*bash'
-        'wget.*\|[[:space:]]*sh'
-        'wget.*\|[[:space:]]*bash'
-        'systemctl[[:space:]]+disable'
-        'systemctl[[:space:]]+mask'
-        'apt-get[[:space:]]+remove'
-        'apt-get[[:space:]]+purge'
-        'apt[[:space:]]+remove'
-        'apt[[:space:]]+purge'
-        'dpkg[[:space:]]+--remove'
-        'dpkg[[:space:]]+--purge'
-        'pip[[:space:]]+uninstall'
-        'npm[[:space:]]+uninstall'
-        # Never-ending commands: these block the update service until
-        # TimeoutStartSec kills it. Root cause of the 2026-09-16 timeout
-        # failure, where the LLM suggested `hermes gateway run --replace`
-        # and the foreground gateway ran until systemd terminated the unit.
-        # `hermes gateway restart` is the correct, bounded alternative and
-        # is on the allowlist.
-        'hermes[[:space:]]+gateway[[:space:]]+run'
-        'hermes[[:space:]]+serve'
-        'hermes[[:space:]]+dashboard'
-        'tail[[:space:]]+-f'
-        'journalctl[[:space:]]+-f'
-        'docker[[:space:]]+logs[[:space:]]+-f'
-        'docker[[:space:]]+(attach|exec[[:space:]]+-it)'
-        'watch[[:space:]]'
-        'sleep[[:space:]]+[0-9]{3,}'
-    )
-
-    local pattern
-    for pattern in "${blocklist[@]}"; do
-        if echo "$cmd" | grep -qiE "$pattern"; then
-            log_warn "Blocked unsafe command: $cmd (matched: $pattern)"
-            return 1
-        fi
-    done
-
-    return 0
-}
-
-# Detect LLM API key from common locations if not set in config.
-# Checks (in order): config/env value, ~/.hermes/.env OPENROUTER_API_KEY,
-# ~/.hermes/.env OPENAI_API_KEY.
-detect_llm_api_key() {
-    if [[ -n "$LLM_API_KEY" ]]; then
-        return 0
-    fi
-
-    local env_file="${HERMES_USER_HOME:-/root}/.hermes/.env"
-    if [[ -f "$env_file" ]]; then
-        # Try OPENROUTER_API_KEY first (matches default LLM_API_URL)
-        local key
-        key="$(grep -E '^OPENROUTER_API_KEY=' "$env_file" 2>/dev/null \
-            | head -1 | cut -d= -f2- | tr -d '\"' | tr -d "'")" || true
-        if [[ -n "$key" ]]; then
-            LLM_API_KEY="$key"
-            log_info "LLM API key detected from OPENROUTER_API_KEY in $env_file"
-            return 0
-        fi
-        # Fall back to OPENAI_API_KEY
-        key="$(grep -E '^OPENAI_API_KEY=' "$env_file" 2>/dev/null \
-            | head -1 | cut -d= -f2- | tr -d '\"' | tr -d "'")" || true
-        if [[ -n "$key" ]]; then
-            LLM_API_KEY="$key"
-            log_info "LLM API key detected from OPENAI_API_KEY in $env_file"
-            return 0
-        fi
-    fi
-
-    return 1
-}
-
-# Send the diagnostic report to an LLM and get remediation commands back.
-# Writes suggested commands to stdout (one per line, prefixed with "CMD: ").
-# Returns 0 on success, 1 on failure.
-llm_get_remediation() {
-    local report_content="$1"
-
-    if ! detect_llm_api_key; then
-        log_warn "LLM remediation skipped: no API key found (set LLM_API_KEY in config or OPENROUTER_API_KEY/OPENAI_API_KEY in ~/.hermes/.env)"
-        add_warning "LLM Remediation" "No API key found — skipped"
-        return 1
-    fi
-
-    local system_prompt
-    system_prompt="You are a Linux SRE diagnostic assistant. You receive a system diagnostic report after an automatic update. Your job is to identify issues and suggest remediation commands. Rules:
-1. Only suggest shell commands that fix the identified issues.
-2. Each command must be on its own line, prefixed with 'CMD: '.
-3. Every command must be a single, plain, non-interactive invocation that
-   terminates on its own. No pipes, no ';', no '&&', no redirection, no
-   command substitution, no backgrounding.
-4. Commands are accepted only from this allowlist:
-   systemctl restart|start|reload|reset-failed <unit>
-   systemctl --user restart|start|reload|reset-failed <unit>
-   systemctl daemon-reload
-   docker restart|start <container>
-   docker compose up -d
-   docker image prune -f / docker system prune -f
-   apt-get install -f -y / apt-get check / apt-get update / apt-get autoclean
-   dpkg --configure -a
-   journalctl --vacuum-size=<size> / journalctl --vacuum-time=<time>
-   hermes gateway restart / hermes gateway status / hermes doctor
-   needrestart -r a
-   snap refresh
-   Anything else is rejected automatically, so do not suggest it.
-5. NEVER suggest a long-running or foreground command (hermes gateway run,
-   hermes serve, tail -f, journalctl -f, watch, sleep). They hang the
-   update service until systemd kills it. Use 'hermes gateway restart'.
-6. Never suggest destructive commands (rm -rf, mkfs, dd, shutdown, reboot,
-   apt remove/purge, systemctl disable/mask).
-7. If no remediation is needed, output 'NO_REMEDIATION_NEEDED'.
-8. Maximum 10 commands."
-
-    local user_prompt
-    user_prompt="Diagnostic report:\n\n${report_content}\n\nSuggest remediation commands:"
-
-    # Build JSON payload using python3 for safe escaping
-    local payload
-    payload="$(python3 -c "
-import json, sys
-msg = {
-    'model': sys.argv[1],
-    'messages': [
-        {'role': 'system', 'content': sys.argv[2]},
-        {'role': 'user', 'content': sys.argv[3]}
-    ],
-    'temperature': 0.3,
-    'max_tokens': 2000
-}
-print(json.dumps(msg))
-" "$LLM_MODEL" "$system_prompt" "$user_prompt" 2>/dev/null)" || {
-        log_error "Failed to build LLM API request payload"
-        return 1
-    }
-
-    log_info "Requesting LLM remediation suggestions (model: $LLM_MODEL)..."
-
-    local response_file
-    response_file="$(mktemp)"
-
-    local http_code
-    http_code="$(curl -s -o "$response_file" -w '%{http_code}' \
-        --max-time "$LLM_TIMEOUT" \
-        -X POST "$LLM_API_URL" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $LLM_API_KEY" \
-        -d "$payload" 2>/dev/null || echo "000")"
-
-    if [[ "$http_code" != "200" ]]; then
-        log_error "LLM API returned HTTP $http_code"
-        add_error "LLM Remediation" "API request failed (HTTP $http_code)"
-        cat "$response_file" >> "$LOG_FILE" 2>/dev/null || true
-        rm -f "$response_file"
-        return 1
-    fi
-
-    # Extract the assistant's message content
-    local llm_response
-    llm_response="$(python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    print(d['choices'][0]['message']['content'])
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    sys.exit(1)
-" < "$response_file" 2>>"$LOG_FILE")" || {
-        log_error "Failed to parse LLM response"
-        add_error "LLM Remediation" "Failed to parse API response"
-        rm -f "$response_file"
-        return 1
-    }
-
-    rm -f "$response_file"
-
-    # Log the full LLM response
-    log_info "LLM response:"
-    echo "$llm_response" >> "$LOG_FILE"
-
-    # Check if LLM says no remediation needed
-    if echo "$llm_response" | grep -qi 'NO_REMEDIATION_NEEDED'; then
-        log_info "LLM determined no remediation is needed"
-        return 1
-    fi
-
-    # Extract CMD: lines
-    local commands
-    commands="$(echo "$llm_response" | grep '^CMD: ' | sed 's/^CMD: //' || true)"
-    if [[ -z "$commands" ]]; then
-        log_warn "LLM did not suggest any remediation commands"
-        return 1
-    fi
-
-    echo "$commands"
-    return 0
-}
-
-# Run the full diagnostic, then if issues are found, ask the LLM for
-# remediation commands, safety-check each, execute safe ones, and
-# re-run the diagnostic. Repeat up to LLM_MAX_REMEDIATION_ATTEMPTS times.
-run_diagnostic_and_remediate() {
-    if [[ "$DIAGNOSTIC_ENABLED" != "true" ]]; then
-        log_info "Full diagnostic disabled, skipping"
-        return 0
-    fi
-
-    local attempt=0
-    local max_attempts="${LLM_MAX_REMEDIATION_ATTEMPTS:-3}"
-
-    while (( attempt < max_attempts )); do
-        attempt=$((attempt + 1))
-
-        # Reset per-round classification counters
-        DIAG_ACTIONABLE=0
-        DIAG_ADVISORY=0
-
-        # Run diagnostic
-        if run_full_diagnostic; then
-            log_info "Diagnostic passed — no issues found (attempt $attempt)"
-            return 0
-        fi
-
-        # Issues found
-        log_warn "Diagnostic found $DIAG_ACTIONABLE actionable / $DIAG_ADVISORY advisory finding(s) (attempt $attempt/$max_attempts)"
-
-        # Advisory-only findings are reported but never auto-remediated:
-        # a disk at 85% or journal noise is a human decision, and asking a
-        # model to "fix" it produces churn, not repair.
-        if [[ "$REMEDIATE_ON_ACTIONABLE_ONLY" == "true" ]] && (( DIAG_ACTIONABLE == 0 )); then
-            log_info "Only advisory findings present — skipping LLM remediation"
-            return 0
-        fi
-
-        if [[ "$LLM_REMEDIATION_ENABLED" != "true" ]]; then
-            log_warn "LLM remediation is disabled — issues left unresolved"
-            add_warning "Diagnostic" "Issues found but LLM remediation disabled"
-            return 1
-        fi
-
-        if (( attempt == max_attempts )); then
-            log_warn "Max remediation attempts reached ($max_attempts)"
-            add_warning "Diagnostic" "Unresolved issues after $max_attempts remediation attempts"
-            return 1
-        fi
-
-        # Read diagnostic report
-        local report_content
-        report_content="$(cat "$DIAGNOSTIC_REPORT" 2>/dev/null || true)"
-        if [[ -z "$report_content" ]]; then
-            log_error "Diagnostic report is empty"
-            return 1
-        fi
-
-        # Ask LLM for remediation
-        local remediation_cmds
-        remediation_cmds="$(llm_get_remediation "$report_content")" || {
-            log_warn "LLM remediation did not produce commands (attempt $attempt)"
-            # If the LLM said no remediation needed, stop
-            return 1
-        }
-
-        local cmd
-        local executed=0
-        local blocked=0
-
-        while IFS= read -r cmd; do
-            [[ -z "$cmd" ]] && continue
-            # Strip leading/trailing whitespace
-            cmd="$(echo "$cmd" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            [[ -z "$cmd" ]] && continue
-
-            if ! is_command_safe "$cmd"; then
-                blocked=$((blocked + 1))
-                add_warning "LLM Remediation" "Blocked unsafe command: $cmd"
-                continue
-            fi
-
-            # `hermes gateway restart` is allowlisted and bounded, but it
-            # drains in-flight agent turns. Issued from inside an agent
-            # session it deadlocks against this very process (see
-            # restart_hermes_gateway). Route it through the guarded helper.
-            if [[ "$cmd" == "hermes gateway restart" ]]; then
-                if restart_hermes_gateway; then
-                    executed=$((executed + 1))
-                else
-                    blocked=$((blocked + 1))
-                fi
-                continue
-            fi
-
-            log_info "Executing remediation command: $cmd"
-            # No eval: commands are single plain invocations (metacharacters
-            # are rejected by is_command_safe), so word-splitting via an
-            # array is both sufficient and safer. A hard timeout guarantees
-            # a misbehaving command cannot hang the systemd unit.
-            local -a cmd_argv
-            read -r -a cmd_argv <<<"$cmd"
-            if timeout --signal=TERM --kill-after=15s \
-                "$REMEDIATION_CMD_TIMEOUT" "${cmd_argv[@]}" >>"$LOG_FILE" 2>&1; then
-                log_info "Remediation command succeeded: $cmd"
-                executed=$((executed + 1))
-            else
-                local rc=$?
-                if (( rc == 124 || rc == 137 )); then
-                    log_warn "Remediation command timed out after ${REMEDIATION_CMD_TIMEOUT}s: $cmd"
-                    add_warning "LLM Remediation" "Command timed out: $cmd"
-                else
-                    log_warn "Remediation command failed (exit $rc): $cmd"
-                    add_warning "LLM Remediation" "Command failed: $cmd"
-                fi
-            fi
-        done <<< "$remediation_cmds"
-
-        log_info "Remediation round $attempt: $executed executed, $blocked blocked"
-
-        if (( executed == 0 )); then
-            log_warn "No safe remediation commands executed (attempt $attempt)"
-            add_warning "LLM Remediation" "No safe commands to execute in round $attempt"
-            return 1
-        fi
-
-        # Wait briefly for services to settle before re-diagnosing
-        sleep 5
-    done
-
-    return 1
-}
-
-# ─── Reboot scheduling (deferred to end of run) ──────────────────────────────
-
-schedule_reboot_if_required() {
-    if [[ "$REBOOT_REQUIRED" != "true" ]]; then
-        return 0
-    fi
-
-    if [[ "$AUTO_REBOOT" != "true" ]]; then
-        add_warning "OS" "Reboot required; AUTO_REBOOT is disabled"
-        return 0
-    fi
-
+schedule_compulsory_reboot() {
     notify_telegram \
-        "[${HOSTNAME_LABEL}] Reboot required; scheduled in ${REBOOT_DELAY} minutes."
+        "[${HOSTNAME_LABEL}] Compulsory reboot scheduled in ${REBOOT_DELAY} minutes. Cancel with: shutdown -c"
 
     if ! shutdown -r "+${REBOOT_DELAY}" \
-        "Automatic reboot after controlled system update"; then
-        add_error "OS" "Failed to schedule reboot"
+        "Compulsory reboot after controlled system update"; then
+        add_error "OS" "Failed to schedule compulsory reboot"
         return 1
     fi
 
-    log_info "Reboot scheduled in ${REBOOT_DELAY} minutes"
+    log_info "Compulsory reboot scheduled in ${REBOOT_DELAY} minutes"
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -1820,8 +1322,8 @@ main() {
     # Health checks
     run_health_checks
 
-    # Full diagnostic + LLM auto-remediation
-    run_diagnostic_and_remediate || true
+    # Full diagnostic (reporting only)
+    run_full_diagnostic || true
 
     # Final assessment
     log_info "========================================"
@@ -1839,8 +1341,8 @@ main() {
         has_warnings=true
     fi
 
-    # Schedule reboot only after all updates and health checks are done
-    schedule_reboot_if_required
+    # Compulsory reboot after all updates and health checks are done
+    schedule_compulsory_reboot
 
     local header
     header="\nTime: $(date '+%Y-%m-%d %H:%M:%S %Z')"

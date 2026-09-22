@@ -2,7 +2,7 @@
 #
 # e2e-test.sh — End-to-end test for controlled-system-update v3.0.0
 # Tests: file layout, config, systemd units, script syntax, lock contention,
-# logging, health checks, diagnostic + LLM remediation, Telegram notification path
+# logging, health checks, diagnostic, Telegram notification path
 #
 # Destructive tests (real system updates) are gated behind RUN_DESTRUCTIVE_TESTS=true
 # CI should use mocked commands and a temporary CSU_CONFIG, not real package upgrades.
@@ -139,11 +139,11 @@ for var in UPDATE_DOCKER UPDATE_HERMES UPDATE_SNAP UPDATE_NPM UPDATE_PYTHON; do
     fi
 done
 
-# Verify tightened defaults
-if [[ "${AUTO_REBOOT:-}" == "false" ]]; then
-    pass "AUTO_REBOOT = false (safe default)"
+# Verify compulsory reboot is configured
+if [[ -n "${REBOOT_DELAY:-}" ]]; then
+    pass "REBOOT_DELAY = ${REBOOT_DELAY:-} (compulsory reboot configured)"
 else
-    warn "AUTO_REBOOT = ${AUTO_REBOOT:-} (expected false for safety)"
+    fail "REBOOT_DELAY not set (compulsory reboot requires a delay)"
 fi
 
 if [[ "${DIST_UPGRADE:-}" == "false" ]]; then
@@ -487,77 +487,30 @@ else
     warn "Local skill file missing at $local_skill (may not be installed on this host)"
 fi
 
-# ─── 13. Diagnostic + LLM Remediation Feature ──────────────────────────────
+# ─── 13. Diagnostic Feature ─────────────────────────────────────────────────
 
 echo ""
-echo "--- 13. Diagnostic + LLM Remediation Feature ---"
+echo "--- 13. Diagnostic Feature ---"
 
-# Check that the diagnostic functions exist in the script
+# Check that the diagnostic function exists in the script
 if grep -q 'run_full_diagnostic()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
     pass "run_full_diagnostic function exists in auto-update.sh"
 else
     fail "run_full_diagnostic function missing from auto-update.sh"
 fi
 
-if grep -q 'llm_get_remediation()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "llm_get_remediation function exists in auto-update.sh"
+# Check that diagnostic is called in main()
+if grep -q 'run_full_diagnostic' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "Diagnostic is wired into main()"
 else
-    fail "llm_get_remediation function missing from auto-update.sh"
+    fail "Diagnostic is not wired into main()"
 fi
 
-if grep -q 'run_diagnostic_and_remediate()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "run_diagnostic_and_remediate function exists in auto-update.sh"
+# Check config option exists in the template
+if grep -q "^DIAGNOSTIC_ENABLED=" "$REPO/config/auto-update.conf" 2>/dev/null; then
+    pass "Config option DIAGNOSTIC_ENABLED exists in template"
 else
-    fail "run_diagnostic_and_remediate function missing from auto-update.sh"
-fi
-
-if grep -q 'is_command_safe()' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "is_command_safe function exists in auto-update.sh"
-else
-    fail "is_command_safe function missing from auto-update.sh"
-fi
-
-# Check that diagnostic+remediation is called in main()
-if grep -q 'run_diagnostic_and_remediate' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "Diagnostic+remediation is wired into main()"
-else
-    fail "Diagnostic+remediation is not wired into main()"
-fi
-
-# Check config options exist in the template
-for opt in DIAGNOSTIC_ENABLED LLM_REMEDIATION_ENABLED LLM_API_URL LLM_MODEL LLM_TIMEOUT LLM_MAX_REMEDIATION_ATTEMPTS; do
-    if grep -q "^${opt}=" "$REPO/config/auto-update.conf" 2>/dev/null; then
-        pass "Config option $opt exists in template"
-    else
-        fail "Config option $opt missing from template"
-    fi
-done
-
-# Verify the safety blocklist blocks dangerous commands
-# Check that the blocklist patterns are present in the script
-if grep -q 'rm.*-rf.*/' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'mkfs' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'shutdown' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'reboot' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'dd.*of=/dev/' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'curl.*sh' "$REPO/scripts/auto-update.sh" && \
-   grep -q 'apt-get.*purge' "$REPO/scripts/auto-update.sh"; then
-    pass "Safety blocklist covers destructive commands (rm -rf, mkfs, dd, shutdown, reboot, curl|sh, purge)"
-else
-    fail "Safety blocklist is missing destructive command patterns"
-fi
-
-# Check that LLM API key auto-detection is present
-if grep -q 'OPENROUTER_API_KEY' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "LLM API key auto-detection (OPENROUTER_API_KEY) present"
-else
-    fail "LLM API key auto-detection missing"
-fi
-
-if grep -q 'OPENAI_API_KEY' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
-    pass "LLM API key fallback (OPENAI_API_KEY) present"
-else
-    fail "LLM API key fallback missing"
+    fail "Config option DIAGNOSTIC_ENABLED missing from template"
 fi
 
 # Verify diagnostic report path is configured
@@ -568,10 +521,17 @@ else
 fi
 
 # Check README documents the feature
-if grep -qi 'Full Diagnostic.*LLM.*Remediation' "$REPO/README.md" 2>/dev/null; then
-    pass "README documents diagnostic + LLM remediation feature"
+if grep -qi 'Full Diagnostic' "$REPO/README.md" 2>/dev/null; then
+    pass "README documents diagnostic feature"
 else
-    fail "README does not document diagnostic + LLM remediation feature"
+    fail "README does not document diagnostic feature"
+fi
+
+# Verify compulsory reboot is wired in
+if grep -q 'schedule_compulsory_reboot' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    pass "Compulsory reboot is wired into main()"
+else
+    fail "Compulsory reboot is not wired into main()"
 fi
 
 # Check CHANGELOG has an entry for the current version
@@ -579,6 +539,19 @@ if grep -qF "[${EXPECTED_VERSION}]" "$REPO/CHANGELOG.md" 2>/dev/null; then
     pass "CHANGELOG has v${EXPECTED_VERSION} entry"
 else
     fail "CHANGELOG missing v${EXPECTED_VERSION} entry"
+fi
+
+# Verify no LLM remediation code remains
+if grep -qi 'llm_get_remediation\|is_command_safe\|run_diagnostic_and_remediate' "$REPO/scripts/auto-update.sh" 2>/dev/null; then
+    fail "LLM remediation code still present in auto-update.sh"
+else
+    pass "LLM remediation code fully removed"
+fi
+
+if grep -qi 'LLM_REMEDIATION_ENABLED\|LLM_API_URL\|LLM_MODEL\|REMEDIATION_CMD_TIMEOUT' "$REPO/config/auto-update.conf" 2>/dev/null; then
+    fail "LLM config options still present in template"
+else
+    pass "LLM config options fully removed from template"
 fi
 
 # ─── v3.0.0 regression checks ────────────────────────────────────────────────
@@ -589,40 +562,11 @@ echo "--- v3.0.0: incident regressions and portability ---"
 SCRIPT_SRC="$REPO/scripts/auto-update.sh"
 
 # Regression 1 (2026-09-16): log output went to stdout and was captured by
-# command substitution, so log lines were executed as remediation commands.
+# command substitution, splicing log lines into returned data.
 if grep -qE '^\s+echo "\[\$\{ts\}\] \[\$\{level\}\] \$\{msg\}" >&2' "$SCRIPT_SRC"; then
     pass "log() writes to stderr (log lines cannot be captured as commands)"
 else
     fail "log() does not write to stderr — log lines can be executed as commands"
-fi
-
-# Regression 2 (2026-09-16): `hermes gateway run --replace` ran in the
-# foreground until systemd's TimeoutStartSec killed the whole update.
-if grep -q "hermes\[\[:space:\]\]+gateway\[\[:space:\]\]+run" "$SCRIPT_SRC"; then
-    pass "Blocklist rejects foreground 'hermes gateway run'"
-else
-    fail "Blocklist does not reject 'hermes gateway run'"
-fi
-
-# Remediation must be allowlist-gated, not blocklist-only
-if grep -q 'Gate 1 — allowlist of remediation forms' "$SCRIPT_SRC"; then
-    pass "Remediation commands are allowlist-gated"
-else
-    fail "Remediation commands are not allowlist-gated"
-fi
-
-# No eval of model-produced text
-if grep -qE '^\s+if eval "\$cmd"' "$SCRIPT_SRC"; then
-    fail "Remediation still uses eval on LLM output"
-else
-    pass "Remediation does not eval LLM output"
-fi
-
-# Per-command timeout
-if grep -q 'REMEDIATION_CMD_TIMEOUT' "$SCRIPT_SRC"; then
-    pass "Per-command remediation timeout configured"
-else
-    fail "Per-command remediation timeout missing"
 fi
 
 # Precise gateway detection (the loose pgrep matched unrelated shells)
@@ -643,13 +587,6 @@ if grep -q 'restart_hermes_gateway' "$SCRIPT_SRC"; then
     pass "Hermes partial-update gateway recovery present"
 else
     fail "Hermes partial-update gateway recovery missing"
-fi
-
-# Actionable vs advisory classification
-if grep -q 'diag_finding' "$SCRIPT_SRC" && grep -q 'REMEDIATE_ON_ACTIONABLE_ONLY' "$SCRIPT_SRC"; then
-    pass "Diagnostic findings classified actionable vs advisory"
-else
-    fail "Diagnostic finding classification missing"
 fi
 
 # Ubuntu 26.04 / multi-arch portability
@@ -691,16 +628,16 @@ else
     fail "CSU_SOURCE_ONLY sourcing guard missing"
 fi
 
-# Safety-gate unit tests exist and pass
-if [[ -f "$REPO/tests/safety-gate-test.sh" ]]; then
-    pass "Safety-gate unit test suite present"
-    if bash "$REPO/tests/safety-gate-test.sh" >/tmp/csu-safety-gate.out 2>&1; then
-        pass "Safety-gate unit tests pass ($(grep -c '^PASS' /tmp/csu-safety-gate.out) assertions)"
+# Gateway guard unit tests exist and pass
+if [[ -f "$REPO/tests/gateway-guard-test.sh" ]]; then
+    pass "Gateway guard unit test suite present"
+    if bash "$REPO/tests/gateway-guard-test.sh" >/tmp/csu-gateway-guard.out 2>&1; then
+        pass "Gateway guard unit tests pass ($(grep -c '^PASS' /tmp/csu-gateway-guard.out) assertions)"
     else
-        fail "Safety-gate unit tests FAILED (see /tmp/csu-safety-gate.out)"
+        fail "Gateway guard unit tests FAILED (see /tmp/csu-gateway-guard.out)"
     fi
 else
-    fail "Safety-gate unit test suite missing"
+    fail "Gateway guard unit test suite missing"
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

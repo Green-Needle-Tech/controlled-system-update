@@ -2,7 +2,7 @@
 name: controlled-system-update
 description: "Safely stage and verify Linux, Docker, and Hermes updates"
 author: Green-Needle-Tech
-version: 3.2.0
+version: 4.0.0
 platforms: [linux]
 metadata:
   hermes:
@@ -43,7 +43,8 @@ Runs daily at 01:00 SGT (Asia/Singapore) via systemd timer. No user intervention
 
 ### What gets updated automatically (defaults)
 
-1. **OS packages** — apt update + upgrade (dist-upgrade, autoremove, and auto-reboot are opt-in)
+1. **OS packages** — apt update + upgrade (dist-upgrade and autoremove are opt-in)
+   A **compulsory reboot** is scheduled after every run
 2. **Snap packages** — snap refresh (if snap is installed)
 3. **Docker images** — pulls latest images for all running containers, recreates via Compose if changed, prunes dangling images
 4. **Hermes Agent** — `hermes update --yes` (supported updater handles deps, backups, service discovery, bundled-skill sync)
@@ -75,8 +76,7 @@ Key settings:
 - `UPDATE_DOCKER` / `UPDATE_HERMES` / `UPDATE_SNAP` — toggle each phase (default: true)
 - `UPDATE_NPM` / `UPDATE_PYTHON` — opt-in phases (default: false — not OS maintenance)
 - `PKG_HOLDS` — space-separated packages to exclude from upgrades
-- `AUTO_REBOOT` — auto-reboot if `/var/run/reboot-required` (default: false — opt-in)
-- `REBOOT_DELAY` — minutes to wait before auto-reboot (default: 5, cancel with `shutdown -c`)
+- `REBOOT_DELAY` — minutes to wait before compulsory reboot (default: 5, cancel with `shutdown -c`)
 - `DIST_UPGRADE` — run `apt-get dist-upgrade` (default: false — can remove packages)
 - `AUTO_REMOVE` — run `apt-get autoremove` (default: false — opt-in)
 - `LOG_RETENTION_DAYS` — delete log files older than N days (default: 30, 0 = disable)
@@ -92,17 +92,8 @@ Key settings:
 - `NOTIFY_IMMEDIATE` — send a Telegram alert immediately when a high/critical error occurs during the run, instead of only at end-of-run summary (default: true)
 - `INCLUDE_PHASED_UPDATES` — take Ubuntu phased updates immediately (default: false)
 - `DIAGNOSTIC_ENABLED` — run comprehensive post-update diagnostic (default: true)
-- `DIAGNOSTIC_ADVISORY` — categories reported but never auto-remediated (default: `journal memory load`)
-- `REMEDIATE_ON_ACTIONABLE_ONLY` — skip remediation when only advisory findings exist (default: true)
-- `REMEDIATION_CMD_TIMEOUT` — hard timeout per remediation command in seconds (default: 120)
-- `LLM_REMEDIATION_ENABLED` — attempt LLM-based auto-remediation when diagnostic finds issues (default: true)
-- `LLM_API_URL` — OpenAI-compatible chat completions endpoint (default: OpenRouter)
-- `LLM_MODEL` — model to use for remediation suggestions (default: z-ai/glm-5.2)
-- `LLM_API_KEY` — API key; auto-detected from `~/.hermes/.env` (OPENROUTER_API_KEY or OPENAI_API_KEY) if not set
-- `LLM_TIMEOUT` — timeout for each LLM API request in seconds (default: 120)
-- `LLM_MAX_REMEDIATION_ATTEMPTS` — maximum diagnose→remediate→re-diagnose rounds (default: 3)
 
-### Full Diagnostic + LLM Auto-Remediation
+### Full Diagnostic
 
 After all update phases and basic health checks, the script runs a comprehensive diagnostic that covers:
 
@@ -120,36 +111,23 @@ After all update phases and basic health checks, the script runs a comprehensive
 12. **dmesg errors** — filesystem/hardware errors
 13. **Load average**
 
-Findings are classified as **actionable** (broken packages, failed units, dead
-containers, gateway down — fixable by a command) or **advisory** (journal
-noise, memory, load — reported only). With `REMEDIATE_ON_ACTIONABLE_ONLY=true`
-(default), advisory-only runs skip remediation entirely. This is what stops a
-healthy-but-busy host from generating nightly remediation churn.
-
-If actionable issues are found and `LLM_REMEDIATION_ENABLED=true`, the report
-goes to an LLM which suggests remediation commands. Each suggestion must pass
-**two gates**:
-
-1. **Allowlist** — must match a known-safe form: `systemctl
-   restart|start|reload|reset-failed <unit>`, `systemctl daemon-reload`,
-   `docker restart|start <container>`, `docker compose up -d`,
-   `docker image|system prune -f`, `apt-get install -f|check|update|autoclean`,
-   `dpkg --configure -a`, `journalctl --vacuum-size=|--vacuum-time=`,
-   `hermes gateway restart|status`, `hermes doctor`, `needrestart -r a`,
-   `snap refresh`. Anything else is rejected.
-2. **Blocklist** — destructive patterns AND never-ending commands
-   (`hermes gateway run`, `hermes serve`, `tail -f`, `journalctl -f`, `watch`,
-   long `sleep`) are rejected even if gate 1 passed.
-
-Shell metacharacters (`;` `|` `&` `` ` `` `$(` `>` `<`) are rejected outright,
-commands run **without `eval`** as an argv array, and each runs under
-`REMEDIATION_CMD_TIMEOUT`. The gates are covered by 44 assertions in
-`tests/safety-gate-test.sh` (run in CI).
-
-The cycle repeats up to `LLM_MAX_REMEDIATION_ATTEMPTS` times, re-running the
-diagnostic after each round.
+Findings are reported in the log, the diagnostic report, and the Telegram
+notification. No automated remediation is attempted — the script schedules a
+**compulsory reboot** after every run instead.
 
 The diagnostic report is saved to `/var/log/controlled-system-update/diagnostic-report.txt`.
+
+### Compulsory Reboot
+
+After all update phases, health checks, and diagnostic are complete, a
+**compulsory reboot** is scheduled via `shutdown -r +REBOOT_DELAY` (default:
+5 minutes). A Telegram notification is sent before the reboot. Cancel with
+`shutdown -c`.
+
+This replaces the previous opt-in `AUTO_REBOOT` and the LLM auto-remediation
+loop. A clean restart after updates is the simplest reliable recovery: it
+picks up new kernels, restarts all services with upgraded libraries, and
+clears any transient state.
 
 ### Manual operations
 
@@ -206,17 +184,18 @@ sudo systemctl enable --now controlled-system-update.timer
 - `last-run.log` is a symlink to the most recent run's log file
 - Post-update health checks: systemd failed units, Docker container status, Hermes gateway, disk/memory/load
 - Reboot scheduling deferred to end of run — services are not stopped prematurely
+- **Compulsory reboot** after every run — a clean restart replaces LLM auto-remediation
 - Hermes updated via supported `hermes update --yes` (not custom git/uv logic)
 - Hermes hub skills updated via `hermes skills check/update` (never `--force`)
 - Configuration secrets are not exported to child processes (no `set -a`)
 - Configuration ownership and permissions validated before sourcing
 - All logging goes to stderr; only data goes to stdout, so log lines can never
-  be captured by command substitution and executed
+  be captured by command substitution
 - Gateway liveness detected by the real interpreter invocation and systemd unit
   state, not a loose `pgrep` that matches any process mentioning the words
 - A `hermes update` that pulls successfully but fails its own gateway relaunch
   is recovered with a bounded `hermes gateway restart` instead of failing
-- GitHub Actions CI with ShellCheck linting on every push
+- GitHub Actions CI with ShellCheck linting and gateway guard tests on every push
 
 ## Mode 2 — Manual Controlled Update (SRE procedure)
 

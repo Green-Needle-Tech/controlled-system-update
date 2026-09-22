@@ -3,6 +3,42 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [4.0.0] - 2026-09-22
+
+### Removed
+- **LLM auto-remediation removed entirely.** The diagnostic → LLM → remediate
+  loop (`llm_get_remediation`, `is_command_safe`, `run_diagnostic_and_reminate`,
+  `detect_llm_api_key`), all LLM config options (`LLM_REMEDIATION_ENABLED`,
+  `LLM_API_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT`,
+  `LLM_MAX_REMEDIATION_ATTEMPTS`, `REMEDIATION_CMD_TIMEOUT`,
+  `REMEDIATE_ON_ACTIONABLE_ONLY`, `DIAGNOSTIC_ADVISORY`), and the actionable/
+  advisory finding classification have been removed. A clean reboot is a
+  simpler, more reliable recovery than asking a model to patch a broken host
+  unattended at 01:00.
+
+### Changed
+- **Compulsory server reboot after every run.** `AUTO_REBOOT` (opt-in, default
+  false) is replaced by `schedule_compulsory_reboot()` — the server reboots
+  after every update run regardless of `/var/run/reboot-required`. `REBOOT_DELAY`
+  (default 5 minutes) provides a grace period; cancel with `shutdown -c`.
+- **Diagnostic retained for reporting only.** `run_full_diagnostic()` still
+  runs and writes the diagnostic report, but no remediation is attempted.
+- **`tests/safety-gate-test.sh` renamed to `tests/gateway-guard-test.sh`.**
+  Only the gateway restart deadlock guard test is retained; all
+  `is_command_safe()` assertions are removed (the function no longer exists).
+- **CI workflow updated.** The `safety-gate` job is now `gateway-guard`.
+
+### Rationale
+The LLM auto-remediation feature was the source of three production incidents
+(§8.1–8.3 in SPEC.md): log lines executed as commands, a foreground gateway
+hung the systemd unit, and a gateway restart deadlock. While each was fixed
+with increasing layers of safety controls (allowlist, blocklist, metacharacter
+rejection, per-command timeouts, deadlock guards), the fundamental approach of
+asking a model to fix a broken host unattended is inherently fragile. A
+compulsory reboot achieves the same goal — a clean state after updates — with
+zero risk of executing a wrong command.
+
+
 ## [3.2.0] - 2026-09-19
 
 ### Added
