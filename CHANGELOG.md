@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/), dates in UTC.
 
+## [4.1.0] - 2026-09-27
+
+### Fixed
+- **Gateway restart privilege now matches gateway type.** A SYSTEM gateway
+  (`systemctl is-active hermes-gateway.service`) refuses restart from a
+  non-root user ("System gateway restart requires root"), so routing the
+  recovery `hermes gateway restart` through the runuser privilege drop to
+  `$HERMES_USER` made the recovery path dead code on root-hosted gateways
+  (observed 2026-09-26/27: `hermes update` rc=1 → recovery → "requires root"
+  → whole run marked failed even though the code had pulled fine).
+  `restart_hermes_gateway` now detects the system unit and restarts as root
+  (direct when EUID=0, else `sudo -n` with the log written via `sudo tee` to
+  satisfy ShellCheck SC2024); user gateways keep the privilege drop.
+
+### Added
+- **Consecutive-failure escalation for `hermes update`.** Repeated identical
+  fetch failures never self-heal by retrying (2026-09-22..27: corrupted git
+  packs caused `BUG: builtin/pack-objects.c ... should_include_obj` on every
+  nightly run with no escalation). After `HERMES_UPDATE_FAIL_THRESHOLD`
+  (default 3, 0 = never) consecutive failures, the script runs bounded
+  `git fsck` + `git gc --prune=now` on the install repo as the repo-owning
+  user and escalates the Telegram notification to MANUAL INTERVENTION
+  REQUIRED if repair cannot run. Counter persists in `HERMES_STATE_DIR`
+  (default `/var/lib/controlled-system-update`) and resets only on a clean
+  rc=0 update (a "recovered" run still counts).
+- SKILL.md documents both pitfalls and the two new config keys.
+
 ## [4.0.0] - 2026-09-22
 
 ### Removed
