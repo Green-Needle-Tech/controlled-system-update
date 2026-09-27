@@ -83,6 +83,8 @@ Key settings:
 - `HERMES_HOME` / `HERMES_USER_HOME` / `HERMES_USER` / `HERMES_CLI` — auto-detected at runtime (CLI on PATH/common locations; user home from the running gateway process owner; user from the home's owner); set only for non-standard installations (e.g. Hermes installed under `/home/ubuntu` where detection fails)
 - Privilege drop: when the service runs as root but Hermes is owned by a regular user (e.g. `/home/ubuntu`), all hermes commands run as that user via `runuser` — avoids git's "dubious ownership" error without weakening `safe.directory`
 - `HERMES_UPDATE_TIMEOUT` — timeout for `hermes update` in seconds (default: 1800)
+- `HERMES_UPDATE_FAIL_THRESHOLD` — consecutive `hermes update` failures before the script runs git fsck/gc on the install repo and flags it in the notification (default: 3, 0 = never)
+- `HERMES_STATE_DIR` — persistent state dir for cross-run counters (default: /var/lib/controlled-system-update)
 - `HERMES_GATEWAY_RESTART_TIMEOUT` — timeout for `hermes gateway restart` (default: 600). Not the skills timeout: the gateway drains in-flight turns first.
 - `HERMES_SKILLS_MODE` — external skill update mode: `off`, `check` (default), `update`
 - `HERMES_SKILLS_AUDIT` — re-run security checks after check/update (default: true)
@@ -414,6 +416,8 @@ not automatically force replacement of local edits.
 
 ## Pitfalls
 
+- Gateway restart privilege must match gateway type: a SYSTEM gateway (`systemctl is-active hermes-gateway.service`) refuses restart from a non-root user ("System gateway restart requires root"), so routing the recovery `hermes gateway restart` through the runuser privilege drop to `$HERMES_USER` makes the recovery path dead code on root-hosted gateways (observed 2026-09-26/27: update rc=1 → recovery → "requires root" → run marked failed). `restart_hermes_gateway` now detects the system unit and restarts as root (direct when EUID=0, else `sudo -n`); user gateways keep the privilege drop
+- Repeated identical `hermes update` fetch failures never self-heal by retrying (2026-09-22..27: corrupted git packs caused `BUG: builtin/pack-objects.c ... should_include_obj` nightly). After `HERMES_UPDATE_FAIL_THRESHOLD` (default 3) consecutive failures the script runs `git fsck` + `git gc --prune=now` on the install repo as the repo-owning user and escalates the notification
 - `hermes update` from inside an agent session kills the session (gateway restart) — background it
 - `hermes update` can hang on TTY prompts — always use `--yes`
 - apt prompts hang scripts — always DEBIAN_FRONTEND=noninteractive + force-confdef/confold

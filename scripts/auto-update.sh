@@ -156,6 +156,14 @@ hermes_privileged_cmd() {
 }
 HERMES_UPDATE_TIMEOUT="${HERMES_UPDATE_TIMEOUT:-1800}"
 
+# Consecutive hermes-update failures before git-repair escalation (0 = never).
+# Repeated identical failures (e.g. corrupted git object database: "BUG:
+# builtin/pack-objects.c ... should_include_obj") never self-heal by retrying.
+HERMES_UPDATE_FAIL_THRESHOLD="${HERMES_UPDATE_FAIL_THRESHOLD:-3}"
+
+# Persistent state directory for cross-run counters.
+HERMES_STATE_DIR="${HERMES_STATE_DIR:-/var/lib/controlled-system-update}"
+
 # Hermes external skill update mode
 # off:    do nothing
 # check:  report available external skill updates without installing
@@ -683,14 +691,58 @@ restart_hermes_gateway() {
     fi
 
     log_info "Restarting Hermes gateway (bounded to ${HERMES_GATEWAY_RESTART_TIMEOUT}s)..."
-    if hermes_privileged_cmd timeout \
-        --signal=TERM \
-        --kill-after=30s \
-        "$HERMES_GATEWAY_RESTART_TIMEOUT" \
-        env \
-        HOME="$HERMES_USER_HOME" \
-        HERMES_HOME="$HERMES_HOME" \
-        "$HERMES_CLI" gateway restart >>"$LOG_FILE" 2>&1; then
+
+    # PRIVILEGE SELECTION (2026-09-27 fix): a SYSTEM gateway
+    # (systemctl hermes-gateway.service) refuses restart from a non-root
+    # user ("System gateway restart requires root"), while a USER gateway
+    # must be restarted by its owning user. Restarting with the wrong
+    # privilege always fails, which made this recovery path dead code on
+    # root-hosted gateways (observed 2026-09-26/27: hermes update rc=1 ->
+    # recovery -> restart run as $HERMES_USER -> "requires root" -> whole
+    # run marked failed even though the code had pulled fine).
+    local restart_rc=0
+    if systemctl is-active --quiet hermes-gateway.service 2>/dev/null; then
+        log_info "System gateway detected (hermes-gateway.service) - restarting as root"
+        if [[ $EUID -eq 0 ]]; then
+            timeout \
+                --signal=TERM \
+                --kill-after=30s \
+                "$HERMES_GATEWAY_RESTART_TIMEOUT" \
+                env \
+                HOME="$HERMES_USER_HOME" \
+                HERMES_HOME="$HERMES_HOME" \
+                "$HERMES_CLI" gateway restart >>"$LOG_FILE" 2>&1 || restart_rc=$?
+        elif sudo -n true 2>/dev/null; then
+            # tee as root: the redirect would otherwise run in the unprivileged
+            # shell and fail on the root-owned $LOG_FILE (ShellCheck SC2024).
+            sudo -n timeout \
+                --signal=TERM \
+                --kill-after=30s \
+                "$HERMES_GATEWAY_RESTART_TIMEOUT" \
+                env \
+                HOME="$HERMES_USER_HOME" \
+                HERMES_HOME="$HERMES_HOME" \
+                "$HERMES_CLI" gateway restart 2>&1 \
+                | sudo -n tee -a "$LOG_FILE" >/dev/null
+            restart_rc=${PIPESTATUS[0]}
+        else
+            log_warn "System gateway detected but not root and no passwordless sudo - cannot restart"
+            return 1
+        fi
+    else
+        # User gateway: keep the privilege drop (git dubious-ownership etc.).
+        # timeout must stay OUTSIDE runuser.
+        hermes_privileged_cmd timeout \
+            --signal=TERM \
+            --kill-after=30s \
+            "$HERMES_GATEWAY_RESTART_TIMEOUT" \
+            env \
+            HOME="$HERMES_USER_HOME" \
+            HERMES_HOME="$HERMES_HOME" \
+            "$HERMES_CLI" gateway restart >>"$LOG_FILE" 2>&1 || restart_rc=$?
+    fi
+
+    if (( restart_rc == 0 )); then
         sleep 5
         if gateway_is_running; then
             log_info "Hermes gateway restarted successfully"
@@ -699,8 +751,30 @@ restart_hermes_gateway() {
         log_warn "Hermes gateway restart returned success but no gateway is running"
         return 1
     fi
-    log_warn "Hermes gateway restart command failed"
+    log_warn "Hermes gateway restart command failed (rc=$restart_rc)"
     return 1
+}
+
+# Detect the Hermes install directory from the CLI's own report and run a
+# bounded git repair (fsck + gc) as the repo-owning user. Non-destructive:
+# fsck only reports; gc repacks, which clears the most common corruption
+# mode seen 2026-09-22..27 (broken packs after interrupted fetches caused
+# "BUG: builtin/pack-objects.c: should_include_obj ..." every night).
+repair_hermes_git_repo() {
+    local install_dir
+    install_dir="$(run_hermes --version 2>/dev/null | sed -n 's/^Install directory:[[:space:]]*//p' | head -1)"
+    [[ -n "$install_dir" && -d "$install_dir/.git" ]] || return 1
+    log_info "Running git fsck + gc on $install_dir (as user: $HERMES_USER)..."
+    if hermes_privileged_cmd timeout --signal=TERM --kill-after=30s 600 \
+        git -C "$install_dir" fsck --no-dangling >>"$LOG_FILE" 2>&1; then
+        log_info "git fsck passed"
+    else
+        log_warn "git fsck reported problems (see log)"
+    fi
+    hermes_privileged_cmd timeout --signal=TERM --kill-after=30s 900 \
+        git -C "$install_dir" gc --prune=now >>"$LOG_FILE" 2>&1 || return 1
+    log_info "git gc completed"
+    return 0
 }
 
 update_hermes_agent() {
@@ -733,6 +807,13 @@ update_hermes_agent() {
 
     new_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
 
+    # Consecutive-failure escalation (2026-09-27): after N failures in a row,
+    # repair the install git repo and say so loudly in the notification.
+    local fail_file="${HERMES_STATE_DIR}/hermes-update-failures" fail_count=0
+    mkdir -p "$HERMES_STATE_DIR" 2>/dev/null || true
+    [[ -r "$fail_file" ]] && fail_count="$(head -1 "$fail_file" 2>/dev/null || printf '0')"
+    [[ "$fail_count" =~ ^[0-9]+$ ]] || fail_count=0
+
     if (( update_rc != 0 )); then
         # A very common partial failure: the new code IS pulled and installed,
         # but the updater's own gateway relaunch or dashboard cleanup crashed
@@ -746,6 +827,17 @@ update_hermes_agent() {
             return 1
         fi
 
+        fail_count=$((fail_count + 1))
+        printf '%s\n' "$fail_count" > "$fail_file" 2>/dev/null || true
+        if (( HERMES_UPDATE_FAIL_THRESHOLD > 0 && fail_count >= HERMES_UPDATE_FAIL_THRESHOLD )); then
+            log_warn "hermes update has now failed $fail_count consecutive run(s) — attempting git repository repair"
+            if repair_hermes_git_repo; then
+                add_warning "Hermes" "hermes update failed $fail_count consecutive time(s); ran git fsck/gc repair on the install repo — investigate if failures continue"
+            else
+                add_warning "Hermes" "hermes update failed $fail_count consecutive time(s) and git repair could not run — MANUAL INTERVENTION REQUIRED (run 'git fsck' in the Hermes install dir)"
+            fi
+        fi
+
         log_warn "hermes update exited non-zero (rc=$update_rc) — attempting gateway recovery"
         if restart_hermes_gateway; then
             add_warning "Hermes" \
@@ -756,6 +848,9 @@ update_hermes_agent() {
             log_error "Hermes update failed and could not be recovered"
             return 1
         fi
+    else
+        # Clean update: reset the consecutive-failure counter.
+        printf '0\n' > "$fail_file" 2>/dev/null || true
     fi
 
     log_info "Hermes version after update: $new_version"
