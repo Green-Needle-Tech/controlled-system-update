@@ -220,6 +220,19 @@ UPDATE_NPM="${UPDATE_NPM:-false}"
 # Whether to update Python/uv tools — opt-in (not OS maintenance)
 UPDATE_PYTHON="${UPDATE_PYTHON:-false}"
 
+# Whether to update the Hindsight memory server (pip packages in the Hermes
+# venv + service restart) — opt-in. Hindsight is NOT in hermes-agent's
+# lockfile (installed manually via pip into the shared venv), so `hermes
+# update` never touches it. Upgrades can break the torch/sentence-transformers
+# stack (see 2026-09-21 incident), which is why this stays opt-in and
+# self-verifies + rolls back on failure.
+UPDATE_HINDSIGHT="${UPDATE_HINDSIGHT:-false}"
+HINDSIGHT_VENV_PY="${HINDSIGHT_VENV_PY:-/usr/local/lib/hermes-agent/venv/bin/python}"
+HINDSIGHT_SERVICE="${HINDSIGHT_SERVICE:-hindsight-api}"
+HINDSIGHT_URL="${HINDSIGHT_URL:-http://localhost:8888}"
+# Timeout in seconds for the post-restart health/version poll
+HINDSIGHT_STARTUP_TIMEOUT="${HINDSIGHT_STARTUP_TIMEOUT:-90}"
+
 # ─── Full Diagnostic ─────────────────────────────────────────────────────────
 
 # Run a comprehensive post-update diagnostic (beyond basic health checks)
@@ -777,6 +790,48 @@ repair_hermes_git_repo() {
     return 0
 }
 
+# Repair root-owned files inside a user-owned Hermes installation.
+#
+# The updater refuses to touch a checkout containing files owned by another
+# user: "refusing to update <dir>: <file> is owned by uid 0, not the current
+# uid 1000; repair ownership before retrying" (observed 2026-09-30 with
+# venv/bin/tqdm). Root-owned files get in when anything runs pip/python as
+# root against the shared venv — historically the Hindsight phase of this very
+# script. This pre-flight hands every root-owned file back to the directory's
+# owner (only those files; it never touches other users' ownership) so the
+# nightly update self-heals instead of failing until a human chowns by hand.
+repair_hermes_install_ownership() {
+    [[ $EUID -eq 0 ]] || return 0   # needs root to chown; harmless no-op otherwise
+    [[ -x "$HERMES_CLI" ]] || return 0
+
+    local install_dir owner_uid owner_gid bad_count
+    install_dir="$(run_hermes --version 2>/dev/null \
+        | sed -n 's/^Install directory:[[:space:]]*//p' | head -1)"
+    [[ -n "$install_dir" && -d "$install_dir" ]] || return 0
+
+    owner_uid="$(stat -c '%u' "$install_dir" 2>/dev/null || true)"
+    owner_gid="$(stat -c '%g' "$install_dir" 2>/dev/null || true)"
+    [[ -n "$owner_uid" ]] || return 0
+    # Nothing to do for root-owned installs (root-owned files are expected).
+    (( owner_uid != 0 )) || return 0
+
+    bad_count="$(find "$install_dir" -xdev -uid 0 -print 2>/dev/null | wc -l)"
+    (( bad_count > 0 )) || return 0
+
+    log_warn "Found $bad_count root-owned file(s) in $install_dir — repairing ownership to $owner_uid:$owner_gid"
+    if find "$install_dir" -xdev -uid 0 \
+        -exec chown "$owner_uid:$owner_gid" {} + >> "$LOG_FILE" 2>&1; then
+        add_warning "Hermes" \
+            "Repaired $bad_count root-owned file(s) in $install_dir (chown to $owner_uid) — 'hermes update' would have refused to run; find what ran pip as root against the venv"
+        log_info "Ownership repair complete"
+    else
+        add_error "Hermes" \
+            "Could not chown $bad_count root-owned file(s) in $install_dir — 'hermes update' will likely refuse to run; MANUAL: sudo chown -R $owner_uid:$owner_gid $install_dir"
+        return 1
+    fi
+    return 0
+}
+
 update_hermes_agent() {
     log_info "=== Hermes Agent Update ==="
 
@@ -789,6 +844,10 @@ update_hermes_agent() {
         add_warning "Hermes" "Hermes CLI not executable at $HERMES_CLI"
         return 0
     fi
+
+    # Pre-flight: the updater refuses to run on a checkout containing
+    # root-owned files; repair them (as the install's owner) first.
+    repair_hermes_install_ownership
 
     local old_version new_version
     old_version="$(run_hermes --version 2>/dev/null || printf 'unknown')"
@@ -1037,6 +1096,124 @@ update_npm_packages() {
         log_info "All global npm packages up to date"
     fi
     log_info "npm package update complete"
+}
+
+hindsight_current_version() {
+    # Returns the api_version reported by the running server, or "" if down.
+    curl -s -m 10 "$HINDSIGHT_URL/version" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('api_version',''))" \
+        2>/dev/null || true
+}
+
+# Run a command as the owner of the Hindsight venv when this script runs as
+# root but the venv belongs to a regular user (the standard root-hosted
+# Hermes deployment: /usr/local/lib/hermes-agent owned by uid 1000).
+#
+# Running pip as root against that venv is the ORIGINAL CAUSE of the 2026-09-30
+# incident: root-owned files (venv/bin/tqdm etc.) made `hermes update` refuse
+# to run ("owned by uid 0, not the current uid 1000"). Every venv write —
+# pip install, pip show (cache), import checks — must run as the venv owner.
+# Redirections like >> "$LOG_FILE" are opened by this root shell before the
+# runuser exec, so logging is unaffected.
+hindsight_privileged_pip() {
+    local venv_owner
+    venv_owner="$(stat -c '%U' "$HINDSIGHT_VENV_PY" 2>/dev/null || true)"
+    if [[ $EUID -eq 0 && -n "$venv_owner" && "$venv_owner" != "root" ]] \
+        && command -v runuser &>/dev/null; then
+        runuser -u "$venv_owner" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+update_hindsight() {
+    log_info "=== Hindsight Memory Server Update ==="
+    if [[ "$UPDATE_HINDSIGHT" != "true" ]]; then
+        log_info "Hindsight updates disabled, skipping"
+        return 0
+    fi
+    if [[ ! -x "$HINDSIGHT_VENV_PY" ]]; then
+        log_info "Hindsight venv python not found at $HINDSIGHT_VENV_PY, skipping"
+        return 0
+    fi
+    if ! systemctl cat "$HINDSIGHT_SERVICE" &>/dev/null; then
+        log_info "systemd unit $HINDSIGHT_SERVICE not found, skipping"
+        return 0
+    fi
+
+    local old_version
+    old_version="$(hindsight_current_version)"
+    if [[ -z "$old_version" ]]; then
+        # A failed upgrade on a server that is already down risks making the
+        # script the scapegoat for a pre-existing outage. Bail out loudly.
+        add_error "Hindsight" \
+            "$HINDSIGHT_URL/version unreachable BEFORE update — not touching a down server"
+        return 1
+    fi
+    log_info "Hindsight running version: $old_version"
+
+    # Installed package versions (for rollback)
+    local old_pkg_ver
+    old_pkg_ver="$(hindsight_privileged_pip "$HINDSIGHT_VENV_PY" -m pip show hindsight-api 2>/dev/null \
+        | awk '/^Version:/{print $2}')"
+
+    log_info "Upgrading hindsight-all + hindsight-api via pip (as venv owner)..."
+    if ! hindsight_privileged_pip "$HINDSIGHT_VENV_PY" -m pip install -U hindsight-all hindsight-api \
+        >> "$LOG_FILE" 2>&1; then
+        add_error "Hindsight" "pip install -U hindsight-all hindsight-api failed"
+        return 1
+    fi
+
+    # Pre-restart sanity check: the embedding/LLM stack must still import.
+    # This catches the 2026-09-21-style torch/sentence-transformers binary
+    # mismatch BEFORE we restart the service into a crash loop.
+    if ! hindsight_privileged_pip "$HINDSIGHT_VENV_PY" -c "import torch, sentence_transformers, huggingface_hub" \
+        >> "$LOG_FILE" 2>&1; then
+        log_error "Post-upgrade import check failed — rolling back to $old_pkg_ver"
+        if [[ -n "$old_pkg_ver" ]]; then
+            hindsight_privileged_pip "$HINDSIGHT_VENV_PY" -m pip install \
+                "hindsight-all==$old_pkg_ver" "hindsight-api==$old_pkg_ver" \
+                >> "$LOG_FILE" 2>&1 || true
+        fi
+        add_error "Hindsight" \
+            "Upgrade broke torch/sentence-transformers imports; rolled back to $old_pkg_ver"
+        return 1
+    fi
+
+    log_info "Restarting $HINDSIGHT_SERVICE..."
+    if ! systemctl restart "$HINDSIGHT_SERVICE"; then
+        add_error "Hindsight" "systemctl restart $HINDSIGHT_SERVICE failed"
+        return 1
+    fi
+
+    # Poll /version until the server answers (model loading can take ~30s)
+    local waited=0 new_version=""
+    while (( waited < HINDSIGHT_STARTUP_TIMEOUT )); do
+        new_version="$(hindsight_current_version)"
+        [[ -n "$new_version" ]] && break
+        sleep 5
+        (( waited += 5 ))
+    done
+    if [[ -z "$new_version" ]]; then
+        add_error "Hindsight" \
+            "Server did not answer $HINDSIGHT_URL/version within ${HINDSIGHT_STARTUP_TIMEOUT}s of restart"
+        return 1
+    fi
+
+    local health
+    health="$(curl -s -m 10 "$HINDSIGHT_URL/health" 2>/dev/null || true)"
+    if ! grep -q '"status":"healthy"' <<<"$health"; then
+        add_error "Hindsight" "Server up (v$new_version) but /health not healthy: $health"
+        return 1
+    fi
+
+    if [[ "$new_version" == "$old_version" ]]; then
+        log_info "Hindsight already at latest ($new_version)"
+    else
+        log_info "Hindsight updated: $old_version -> $new_version"
+    fi
+    log_info "Hindsight update complete (v$new_version, healthy)"
+    return 0
 }
 
 # ─── Health checks ───────────────────────────────────────────────────────────
@@ -1413,6 +1590,7 @@ main() {
     verify_required_hermes_skills || true
     update_python_packages
     update_npm_packages
+    update_hindsight || true
 
     # Health checks
     run_health_checks
